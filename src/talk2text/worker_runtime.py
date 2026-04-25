@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from multiprocessing.connection import Connection
 import time
+from multiprocessing.connection import Connection
 from typing import Any
 
 from .models import CleanupUpdate, LiveTranscriptionUpdate, RecordedAudio

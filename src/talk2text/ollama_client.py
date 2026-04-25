@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 import json
+from collections.abc import Callable
 from typing import Any
 from urllib import error, request
 
@@ -79,7 +79,11 @@ class OllamaClient:
         return TranscriptCleanup(
             cleaned_text=str(data.get("cleaned_text", raw_text)).strip() or raw_text,
             summary=str(data.get("summary", "")).strip(),
-            action_items=[str(item).strip() for item in data.get("action_items", []) if str(item).strip()],
+            action_items=[
+                str(item).strip()
+                for item in data.get("action_items", [])
+                if str(item).strip()
+            ],
         )
 
     def _request_streamed_chat(

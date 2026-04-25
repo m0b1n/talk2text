@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from pathlib import Path
 import tempfile
 import threading
 import wave
+from pathlib import Path
 
 from PySide6.QtCore import QIODevice
 from PySide6.QtMultimedia import QAudioDevice, QAudioFormat, QAudioSource, QMediaDevices

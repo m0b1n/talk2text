@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 from pathlib import Path
-import threading
 
 from .errors import ProcessingCancelledError
 from .models import TranscriptionOutput
@@ -65,7 +65,9 @@ class FasterWhisperTranscriber:
                 info, "language", None
             ):
                 notes.append(
-                    f"Detected language {info.language} with confidence {info.language_probability:.2f}"
+                    "Detected language "
+                    f"{info.language} with confidence "
+                    f"{info.language_probability:.2f}"
                 )
 
             return TranscriptionOutput(
@@ -104,4 +106,7 @@ class FasterWhisperTranscriber:
                     errors.append(f"{device}/{compute_type}: {exc}")
 
         joined = "; ".join(errors)
-        raise RuntimeError(f"Failed to initialize faster-whisper model {self._model_name}: {joined}")
+        raise RuntimeError(
+            "Failed to initialize faster-whisper model "
+            f"{self._model_name}: {joined}"
+        )

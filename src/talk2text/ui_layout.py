@@ -65,7 +65,10 @@ QPushButton#recordButton[mode="cancel"] {
     border-color: #f0d1b6;
     color: #fff9f3;
 }
-QPushButton#copyButton, QPushButton#polishButton, QPushButton#applyButton, QPushButton#clearHistoryButton {
+QPushButton#copyButton,
+QPushButton#polishButton,
+QPushButton#applyButton,
+QPushButton#clearHistoryButton {
     background: #d8efe5;
     border: none;
     border-radius: 12px;
@@ -301,7 +304,12 @@ def _build_config_page(window: Any, config: AppConfig, whisper_models: Sequence[
     window.refresh_devices_button = QPushButton("Refresh Devices")
     window.refresh_devices_button.setObjectName("refreshButton")
     window.refresh_devices_button.clicked.connect(window._load_input_devices)
-    _add_config_field(content_layout, "Input Device", window.device_combo, window.refresh_devices_button)
+    _add_config_field(
+        content_layout,
+        "Input Device",
+        window.device_combo,
+        window.refresh_devices_button,
+    )
 
     window.whisper_model_combo = QComboBox()
     window.whisper_model_combo.setEditable(True)

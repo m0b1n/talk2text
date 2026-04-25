@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from multiprocessing import freeze_support
-import sys
-import time
 
-from PySide6.QtCore import QTimer, Qt, Slot
+from PySide6.QtCore import Qt, QTimer, Slot
 from PySide6.QtWidgets import (
     QApplication,
     QListWidgetItem,
@@ -317,7 +317,9 @@ class MainWindow(QMainWindow):
                 min_peak_abs=LIVE_VOICE_PEAK_ABS_THRESHOLD,
             ):
                 return
-            snapshot = self.recorder.snapshot(max_duration_seconds=LIVE_TRANSCRIPTION_WINDOW_SECONDS)
+            snapshot = self.recorder.snapshot(
+                max_duration_seconds=LIVE_TRANSCRIPTION_WINDOW_SECONDS
+            )
         except RuntimeError as exc:
             if "No microphone audio" in str(exc):
                 return

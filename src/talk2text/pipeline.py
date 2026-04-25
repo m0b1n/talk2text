@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 import time
+from collections.abc import Callable
 
 from .errors import ProcessingCancelledError
 from .models import RecordedAudio, TranscriptionResult
@@ -70,7 +70,10 @@ class Talk2TextPipeline:
                 cleaned_text = cleanup.cleaned_text
                 summary = cleanup.summary
                 action_items = cleanup.action_items
-                notes.append(f"Ollama enhancement applied with {ollama_model} in {ollama_elapsed:.2f}s")
+                notes.append(
+                    "Ollama enhancement applied with "
+                    f"{ollama_model} in {ollama_elapsed:.2f}s"
+                )
             except ProcessingCancelledError:
                 raise
             except Exception as exc:

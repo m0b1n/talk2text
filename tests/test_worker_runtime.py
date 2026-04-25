@@ -1,7 +1,12 @@
-from pathlib import Path
 import unittest
+from pathlib import Path
 
-from talk2text.models import RecordedAudio, TranscriptCleanup, TranscriptionOutput, TranscriptionResult
+from talk2text.models import (
+    RecordedAudio,
+    TranscriptCleanup,
+    TranscriptionOutput,
+    TranscriptionResult,
+)
 from talk2text.worker_runtime import (
     _process_cleanup_command,
     _process_live_command,

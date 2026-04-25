@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
+from dataclasses import dataclass
 
 DEFAULT_WHISPER_MODEL = "turbo"
 DEFAULT_OLLAMA_MODEL = "qwen3:8b"

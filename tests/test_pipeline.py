@@ -1,6 +1,6 @@
-from pathlib import Path
 import threading
 import unittest
+from pathlib import Path
 
 from talk2text.errors import ProcessingCancelledError
 from talk2text.models import RecordedAudio, TranscriptCleanup, TranscriptionOutput
@@ -38,7 +38,9 @@ class FakeOllamaClient:
 class Talk2TextPipelineTests(unittest.TestCase):
     def test_process_raises_when_cancelled_before_transcription(self) -> None:
         pipeline = Talk2TextPipeline(
-            transcriber=FakeTranscriber(TranscriptionOutput(raw_text="hello", detected_language="en")),
+            transcriber=FakeTranscriber(
+                TranscriptionOutput(raw_text="hello", detected_language="en")
+            ),
             ollama_client=FakeOllamaClient(),
         )
         audio = RecordedAudio(path=Path("/tmp/fake.wav"), sample_rate=16000, duration_seconds=1.0)
@@ -57,7 +59,9 @@ class Talk2TextPipelineTests(unittest.TestCase):
 
     def test_process_propagates_cancelled_ollama_cleanup(self) -> None:
         pipeline = Talk2TextPipeline(
-            transcriber=FakeTranscriber(TranscriptionOutput(raw_text="hello", detected_language="en")),
+            transcriber=FakeTranscriber(
+                TranscriptionOutput(raw_text="hello", detected_language="en")
+            ),
             ollama_client=FakeOllamaClient(should_cancel=True),
         )
         audio = RecordedAudio(path=Path("/tmp/fake.wav"), sample_rate=16000, duration_seconds=1.0)
