@@ -31,10 +31,10 @@ microphone -> Qt audio capture -> faster-whisper -> transcript
 
 ## Requirements
 
-- Ubuntu
-- Python 3.12
-- `python3-venv`
+- `uv`
 - local Ollama installation if you want transcript polish
+
+The project targets Python `3.12`. `uv` can use an existing Python or manage Python for you.
 
 For GPU acceleration, a working NVIDIA CUDA 12 + cuDNN 9 stack is recommended.
 The app can fall back to CPU transcription.
@@ -42,27 +42,25 @@ The app can fall back to CPU transcription.
 ## Quick Start
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -e .
-.venv/bin/talk2text
+uv sync
+uv run talk2text
 ```
 
 Alternative launch command:
 
 ```bash
-PYTHONPATH=src python3 -m talk2text
+uv run python -m talk2text
 ```
 
-## Install For Your User
+## Install uv
 
-If you want `talk2text` available from your shell without activating a virtual environment:
+Install `uv` with the official installer:
 
 ```bash
-python3 -m pip install --user .
-talk2text
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-If `talk2text` is not found afterward, ensure `~/.local/bin` is on your `PATH`.
+Other installation methods are available in the `uv` docs.
 
 ## Default Behavior
 
@@ -87,18 +85,24 @@ Leave `TALK2TEXT_LANGUAGE` empty for language auto-detection.
 
 ## Development
 
-Install the package in editable mode:
+Sync the project environment:
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -e ".[dev]"
+uv sync
 ```
 
 Run checks:
 
 ```bash
-python3 -m compileall src tests
-.venv/bin/python -m unittest discover -s tests
+uv run python -m compileall src tests
+uv run python -m unittest discover -s tests
+uv run ruff check src tests
+```
+
+When dependencies change, refresh the lockfile with:
+
+```bash
+uv lock
 ```
 
 ## Project Layout

@@ -3,22 +3,21 @@
 ## Setup
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -e ".[dev]"
+uv sync
 ```
 
 ## Run The App
 
 ```bash
-.venv/bin/talk2text
+uv run talk2text
 ```
 
 ## Run Checks
 
 ```bash
-python3 -m compileall src tests
-.venv/bin/python -m unittest discover -s tests
-.venv/bin/ruff check src tests
+uv run python -m compileall src tests
+uv run python -m unittest discover -s tests
+uv run ruff check src tests
 ```
 
 ## Guidelines

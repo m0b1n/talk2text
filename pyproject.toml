@@ -37,7 +37,7 @@ dependencies = [
   "PySide6>=6.7",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
   "ruff>=0.11.0",
 ]
