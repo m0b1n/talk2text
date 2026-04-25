@@ -22,7 +22,7 @@ class AppConfig:
     ollama_base_url: str = DEFAULT_OLLAMA_BASE_URL
     sample_rate: int = DEFAULT_SAMPLE_RATE
     language: str | None = None
-    enhance_with_ollama: bool = True
+    enhance_with_ollama: bool = False
     audio_device: str | None = None
 
     @classmethod
@@ -38,7 +38,6 @@ class AppConfig:
             ollama_base_url=base_url.rstrip("/"),
             sample_rate=sample_rate,
             language=language,
-            enhance_with_ollama=_as_bool(os.getenv("TALK2TEXT_ENHANCE_WITH_OLLAMA"), True),
+            enhance_with_ollama=_as_bool(os.getenv("TALK2TEXT_ENHANCE_WITH_OLLAMA"), False),
             audio_device=audio_device,
         )
-

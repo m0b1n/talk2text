@@ -23,7 +23,7 @@ class AppConfigTests(unittest.TestCase):
             self.assertEqual(config.ollama_model, "qwen3:8b")
             self.assertEqual(config.ollama_base_url, "http://localhost:11434")
             self.assertIsNone(config.language)
-            self.assertTrue(config.enhance_with_ollama)
+            self.assertFalse(config.enhance_with_ollama)
         finally:
             os.environ.clear()
             os.environ.update(original)
