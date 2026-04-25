@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Talk2Text
+Comment=Local speech-to-text app powered by faster-whisper and Ollama
+Exec=/usr/bin/talk2text %U
+Icon=io.github.m0b1n.Talk2Text
+Terminal=false
+StartupNotify=true
+Categories=Utility;AudioVideo;Audio;
+Keywords=speech;transcription;voice;ollama;whisper;

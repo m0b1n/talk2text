@@ -52,6 +52,32 @@ Or:
 PYTHONPATH=src python3 -m talk2text
 ```
 
+## Build A `.deb`
+
+The repo includes a packaging helper around `pyside6-deploy`.
+
+Build the package with:
+
+```bash
+sudo apt install patchelf
+chmod +x build-deb.sh
+./build-deb.sh
+```
+
+That produces a file like:
+
+```text
+talk2text_0.1.0-1_amd64.deb
+```
+
+Install it with:
+
+```bash
+sudo apt install ./talk2text_0.1.0-1_amd64.deb
+```
+
+If you want to inspect or tweak the bundling step directly, the deploy config is in `pysidedeploy.spec`.
+
 ## First-run behavior
 
 - The first Whisper run will download the selected transcription model if it is not already cached.
