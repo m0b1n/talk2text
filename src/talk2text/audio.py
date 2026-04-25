@@ -49,13 +49,17 @@ class MicrophoneRecorder:
         self._io_device = io_device
         self._io_device.readyRead.connect(self._pull_audio)
 
-    def snapshot(self) -> RecordedAudio:
+    def snapshot(self, max_duration_seconds: float | None = None) -> RecordedAudio:
         if self._audio_source is None or self._io_device is None or self._audio_format is None:
             raise RuntimeError("Recording has not started.")
 
         self._pull_audio()
         with self._buffer_lock:
-            payload = bytes(self._buffer)
+            payload = _select_snapshot_payload(
+                payload=bytes(self._buffer),
+                audio_format=self._audio_format,
+                max_duration_seconds=max_duration_seconds,
+            )
 
         return _recorded_audio_from_payload(payload, self._audio_format)
 
@@ -218,3 +222,28 @@ def _recorded_audio_from_payload(payload: bytes, audio_format: QAudioFormat) -> 
         sample_rate=audio_format.sampleRate(),
         duration_seconds=duration_seconds,
     )
+
+
+def _select_snapshot_payload(
+    payload: bytes,
+    audio_format: QAudioFormat,
+    max_duration_seconds: float | None,
+) -> bytes:
+    if max_duration_seconds is None:
+        return payload
+
+    bytes_per_sample = _bytes_per_sample(audio_format)
+    frame_size = max(1, bytes_per_sample * audio_format.channelCount())
+    max_frames = int(audio_format.sampleRate() * max_duration_seconds)
+    if max_frames <= 0:
+        return payload
+
+    max_bytes = max_frames * frame_size
+    if len(payload) <= max_bytes:
+        return payload
+
+    trimmed = payload[-max_bytes:]
+    remainder = len(trimmed) % frame_size
+    if remainder:
+        trimmed = trimmed[remainder:]
+    return trimmed

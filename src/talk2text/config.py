@@ -23,6 +23,7 @@ class AppConfig:
     sample_rate: int = DEFAULT_SAMPLE_RATE
     language: str | None = None
     enhance_with_ollama: bool = False
+    live_transcription: bool = False
     audio_device: str | None = None
 
     @classmethod
@@ -39,5 +40,6 @@ class AppConfig:
             sample_rate=sample_rate,
             language=language,
             enhance_with_ollama=_as_bool(os.getenv("TALK2TEXT_ENHANCE_WITH_OLLAMA"), False),
+            live_transcription=_as_bool(os.getenv("TALK2TEXT_LIVE_TRANSCRIPTION"), False),
             audio_device=audio_device,
         )

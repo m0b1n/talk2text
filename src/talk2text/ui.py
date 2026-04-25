@@ -48,6 +48,7 @@ WHISPER_MODELS = [
 
 LIVE_TRANSCRIPTION_INTERVAL_MS = 900
 LIVE_TRANSCRIPTION_MIN_DURATION_SECONDS = 0.6
+LIVE_TRANSCRIPTION_WINDOW_SECONDS = 8.0
 LIVE_LANGUAGE_LOCK_MIN_DURATION_SECONDS = 2.0
 LIVE_LANGUAGE_LOCK_MIN_WORDS = 3
 
@@ -76,36 +77,32 @@ class PipelineWorker(QObject):
     cancelled = Signal(str)
     progress = Signal(str)
 
-    def __init__(
+    def __init__(self, pipeline: Talk2TextPipeline) -> None:
+        super().__init__()
+        self.pipeline = pipeline
+        self._cancel_event = threading.Event()
+
+    @Slot()
+    def cancel_current(self) -> None:
+        self._cancel_event.set()
+
+    @Slot(object, str, bool, str, object)
+    def process_recording(
         self,
-        pipeline: Talk2TextPipeline,
         recorded_audio: RecordedAudio,
         whisper_model: str,
         use_ollama: bool,
         ollama_model: str,
         language: str | None,
     ) -> None:
-        super().__init__()
-        self.pipeline = pipeline
-        self.recorded_audio = recorded_audio
-        self.whisper_model = whisper_model
-        self.use_ollama = use_ollama
-        self.ollama_model = ollama_model
-        self.language = language
-        self._cancel_event = threading.Event()
-
-    def cancel(self) -> None:
-        self._cancel_event.set()
-
-    @Slot()
-    def run(self) -> None:
+        self._cancel_event.clear()
         try:
             result = self.pipeline.process(
-                recorded_audio=self.recorded_audio,
-                whisper_model=self.whisper_model,
-                use_ollama=self.use_ollama,
-                ollama_model=self.ollama_model,
-                language=self.language,
+                recorded_audio=recorded_audio,
+                whisper_model=whisper_model,
+                use_ollama=use_ollama,
+                ollama_model=ollama_model,
+                language=language,
                 status_callback=self.progress.emit,
                 cancel_requested=self._cancel_event.is_set,
             )
@@ -171,6 +168,8 @@ class LiveTranscriptionWorker(QObject):
 class MainWindow(QMainWindow):
     request_live_transcription = Signal(object, str, object, int)
     cancel_live_transcription = Signal()
+    request_pipeline_processing = Signal(object, str, bool, str, object)
+    cancel_pipeline_processing = Signal()
 
     def __init__(self, config: AppConfig) -> None:
         super().__init__()
@@ -181,8 +180,6 @@ class MainWindow(QMainWindow):
         self.ollama_client = OllamaClient(config.ollama_base_url)
         self.pipeline = Talk2TextPipeline(self.transcriber, self.ollama_client)
 
-        self._worker_thread: QThread | None = None
-        self._worker: PipelineWorker | None = None
         self._recording_started_at: float | None = None
         self._last_result: TranscriptionResult | None = None
         self._history_entries: list[HistoryEntry] = []
@@ -190,6 +187,7 @@ class MainWindow(QMainWindow):
         self._is_processing = False
         self._live_session_id = 0
         self._live_request_in_flight = False
+        self._pipeline_request_in_flight = False
         self._pending_final_audio: RecordedAudio | None = None
         self._session_language_hint: str | None = None
         self._nav_buttons: list[QToolButton] = []
@@ -210,6 +208,18 @@ class MainWindow(QMainWindow):
         self._live_worker.cancelled.connect(self._handle_live_cancelled)
         self._live_thread.finished.connect(self._live_worker.deleteLater)
         self._live_thread.start()
+
+        self._pipeline_thread = QThread(self)
+        self._pipeline_worker = PipelineWorker(self.pipeline)
+        self._pipeline_worker.moveToThread(self._pipeline_thread)
+        self.request_pipeline_processing.connect(self._pipeline_worker.process_recording)
+        self.cancel_pipeline_processing.connect(self._pipeline_worker.cancel_current)
+        self._pipeline_worker.progress.connect(self._set_status)
+        self._pipeline_worker.finished.connect(self._handle_result)
+        self._pipeline_worker.error.connect(self._handle_error)
+        self._pipeline_worker.cancelled.connect(self._handle_cancelled)
+        self._pipeline_thread.finished.connect(self._pipeline_worker.deleteLater)
+        self._pipeline_thread.start()
 
         self.setWindowTitle("Talk2Text")
         self.setFixedSize(300, 400)
@@ -510,6 +520,10 @@ class MainWindow(QMainWindow):
         self.enhance_checkbox.setChecked(self.config.enhance_with_ollama)
         content_layout.addWidget(self.enhance_checkbox)
 
+        self.live_transcription_checkbox = QCheckBox("Enable live transcription")
+        self.live_transcription_checkbox.setChecked(self.config.live_transcription)
+        content_layout.addWidget(self.live_transcription_checkbox)
+
         content_layout.addStretch(1)
         scroll.setWidget(content)
         card_layout.addWidget(scroll)
@@ -625,8 +639,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self.live_timer.stop()
         self.cancel_live_transcription.emit()
-        if self._worker is not None:
-            self._worker.cancel()
+        self.cancel_pipeline_processing.emit()
         if self.recorder.is_recording:
             try:
                 self.recorder.stop()
@@ -634,6 +647,8 @@ class MainWindow(QMainWindow):
                 pass
         self._live_thread.quit()
         self._live_thread.wait(2000)
+        self._pipeline_thread.quit()
+        self._pipeline_thread.wait(2000)
         super().closeEvent(event)
 
     def _show_main_page(self) -> None:
@@ -650,6 +665,9 @@ class MainWindow(QMainWindow):
 
     def _active_language_hint(self) -> str | None:
         return self._session_language_hint or self._selected_language()
+
+    def _live_transcription_enabled(self) -> bool:
+        return self.live_transcription_checkbox.isChecked()
 
     def _selected_ollama_model(self) -> str:
         return self.ollama_model_combo.currentText().strip()
@@ -716,6 +734,7 @@ class MainWindow(QMainWindow):
         self.config.language = self._selected_language()
         self.config.ollama_model = self._selected_ollama_model()
         self.config.enhance_with_ollama = self.enhance_checkbox.isChecked()
+        self.config.live_transcription = self._live_transcription_enabled()
         self._set_status("Settings updated.")
         self._show_main_page()
 
@@ -729,8 +748,8 @@ class MainWindow(QMainWindow):
             self._start_recording()
 
     def _cancel_processing(self) -> None:
-        if self._worker is not None:
-            self._worker.cancel()
+        if self._pipeline_request_in_flight:
+            self.cancel_pipeline_processing.emit()
         elif self._pending_final_audio is not None:
             self._pending_final_audio = None
             if self._live_request_in_flight:
@@ -756,11 +775,15 @@ class MainWindow(QMainWindow):
         self._last_result = None
         self._recording_started_at = time.monotonic()
         self.elapsed_timer.start(250)
-        self.live_timer.start()
-        QTimer.singleShot(300, self._queue_live_transcription)
-        self._show_placeholder_transcript("Listening...")
+        if self._live_transcription_enabled():
+            self.live_timer.start()
+            QTimer.singleShot(300, self._queue_live_transcription)
+            self._show_placeholder_transcript("Listening...")
+            self._set_status("Recording with live transcription...")
+        else:
+            self._show_placeholder_transcript("Recording... transcript will appear after stop.")
+            self._set_status("Recording...")
         self.prompt_label.setText("Tap again to stop")
-        self._set_status("Recording with live transcription...")
         self._set_record_button_mode("recording", "STOP")
         self._set_navigation_enabled(False)
 
@@ -776,22 +799,33 @@ class MainWindow(QMainWindow):
         self.elapsed_timer.stop()
         self.recording_clock.setText("00:00")
         self._live_session_id += 1
-        self._pending_final_audio = recorded_audio
         self._is_processing = True
-        self.prompt_label.setText("Finalizing...")
-        self._set_status("Stopping recording and finalizing transcript...")
         self._set_record_button_mode("cancel", "ABORT")
-        if self._live_request_in_flight:
-            self.cancel_live_transcription.emit()
+        if self._live_transcription_enabled():
+            self._pending_final_audio = recorded_audio
+            self.prompt_label.setText("Finalizing...")
+            self._set_status("Stopping recording and finalizing transcript...")
+            if self._live_request_in_flight:
+                self.cancel_live_transcription.emit()
+                return
+            self._start_pending_final_processing()
             return
-        self._start_pending_final_processing()
+
+        self.prompt_label.setText("Transcribing...")
+        self._set_status("Working on your transcript...")
+        self._run_pipeline(recorded_audio)
 
     def _queue_live_transcription(self) -> None:
-        if not self.recorder.is_recording or self._is_processing or self._live_request_in_flight:
+        if (
+            not self._live_transcription_enabled()
+            or not self.recorder.is_recording
+            or self._is_processing
+            or self._live_request_in_flight
+        ):
             return
 
         try:
-            snapshot = self.recorder.snapshot()
+            snapshot = self.recorder.snapshot(max_duration_seconds=LIVE_TRANSCRIPTION_WINDOW_SECONDS)
         except RuntimeError as exc:
             if "No microphone audio" in str(exc):
                 return
@@ -816,7 +850,7 @@ class MainWindow(QMainWindow):
     def _start_pending_final_processing(self) -> None:
         if self._pending_final_audio is None:
             return
-        if self.recorder.is_recording or self._live_request_in_flight or self._worker is not None:
+        if self.recorder.is_recording or self._live_request_in_flight or self._pipeline_request_in_flight:
             return
 
         recorded_audio = self._pending_final_audio
@@ -826,28 +860,14 @@ class MainWindow(QMainWindow):
         self._run_pipeline(recorded_audio)
 
     def _run_pipeline(self, recorded_audio: RecordedAudio) -> None:
-        self._worker_thread = QThread(self)
-        self._worker = PipelineWorker(
-            pipeline=self.pipeline,
-            recorded_audio=recorded_audio,
-            whisper_model=self._selected_whisper_model(),
-            use_ollama=self.enhance_checkbox.isChecked(),
-            ollama_model=self._selected_ollama_model(),
-            language=self._active_language_hint(),
+        self._pipeline_request_in_flight = True
+        self.request_pipeline_processing.emit(
+            recorded_audio,
+            self._selected_whisper_model(),
+            self.enhance_checkbox.isChecked(),
+            self._selected_ollama_model(),
+            self._active_language_hint(),
         )
-        self._worker.moveToThread(self._worker_thread)
-        self._worker_thread.started.connect(self._worker.run)
-        self._worker.progress.connect(self._set_status)
-        self._worker.finished.connect(self._handle_result)
-        self._worker.error.connect(self._handle_error)
-        self._worker.cancelled.connect(self._handle_cancelled)
-        self._worker.finished.connect(self._worker_thread.quit)
-        self._worker.error.connect(self._worker_thread.quit)
-        self._worker.cancelled.connect(self._worker_thread.quit)
-        self._worker_thread.finished.connect(self._worker.deleteLater)
-        self._worker_thread.finished.connect(self._worker_thread.deleteLater)
-        self._worker_thread.finished.connect(self._clear_worker_state)
-        self._worker_thread.start()
 
     @Slot(object)
     def _handle_live_update(self, update: LiveTranscriptionUpdate) -> None:
@@ -904,6 +924,7 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def _handle_result(self, result: TranscriptionResult) -> None:
+        self._pipeline_request_in_flight = False
         self._last_result = result
         self._show_transcript(result.cleaned_text or result.raw_text)
         self._add_history_entry(result)
@@ -915,6 +936,7 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _handle_error(self, message: str) -> None:
+        self._pipeline_request_in_flight = False
         self._is_processing = False
         self._set_idle_state()
         self._set_status(f"Processing failed: {message}")
@@ -922,6 +944,7 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _handle_cancelled(self, message: str) -> None:
+        self._pipeline_request_in_flight = False
         self._is_processing = False
         self._set_idle_state()
         self._set_status(message)
@@ -1004,13 +1027,13 @@ class MainWindow(QMainWindow):
         self.clear_history_button.setEnabled(enabled)
 
     @Slot()
-    def _clear_worker_state(self) -> None:
-        self._worker = None
-        self._worker_thread = None
-
-    @Slot()
     def _maybe_continue_after_live_worker(self) -> None:
-        if self._pending_final_audio is not None and not self.recorder.is_recording and not self._live_request_in_flight and self._worker is None:
+        if (
+            self._pending_final_audio is not None
+            and not self.recorder.is_recording
+            and not self._live_request_in_flight
+            and not self._pipeline_request_in_flight
+        ):
             self._start_pending_final_processing()
             return
         if (
@@ -1018,7 +1041,7 @@ class MainWindow(QMainWindow):
             and self._pending_final_audio is None
             and not self.recorder.is_recording
             and not self._live_request_in_flight
-            and self._worker is None
+            and not self._pipeline_request_in_flight
         ):
             self._handle_cancelled("Processing cancelled.")
 

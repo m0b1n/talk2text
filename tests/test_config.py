@@ -14,6 +14,7 @@ class AppConfigTests(unittest.TestCase):
                 "TALK2TEXT_OLLAMA_BASE_URL",
                 "TALK2TEXT_LANGUAGE",
                 "TALK2TEXT_ENHANCE_WITH_OLLAMA",
+                "TALK2TEXT_LIVE_TRANSCRIPTION",
             ]:
                 os.environ.pop(key, None)
 
@@ -24,6 +25,19 @@ class AppConfigTests(unittest.TestCase):
             self.assertEqual(config.ollama_base_url, "http://localhost:11434")
             self.assertIsNone(config.language)
             self.assertFalse(config.enhance_with_ollama)
+            self.assertFalse(config.live_transcription)
+        finally:
+            os.environ.clear()
+            os.environ.update(original)
+
+    def test_live_transcription_can_be_enabled_from_env(self) -> None:
+        original = os.environ.copy()
+        try:
+            os.environ["TALK2TEXT_LIVE_TRANSCRIPTION"] = "true"
+
+            config = AppConfig.from_env()
+
+            self.assertTrue(config.live_transcription)
         finally:
             os.environ.clear()
             os.environ.update(original)
