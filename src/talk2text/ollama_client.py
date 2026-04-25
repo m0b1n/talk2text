@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from importlib import import_module
 from typing import Any
-from urllib import error, request
 
 from .errors import ProcessingCancelledError
 from .models import TranscriptCleanup
@@ -39,13 +39,29 @@ def build_cleanup_prompt(raw_text: str, language_hint: str | None = None) -> str
 
 
 class OllamaClient:
-    def __init__(self, base_url: str) -> None:
+    def __init__(self, base_url: str, client: Any | None = None) -> None:
         self.base_url = base_url.rstrip("/")
+        self._client = client
 
     def list_models(self) -> list[str]:
-        payload = self._request_json("/api/tags", None)
-        models = payload.get("models", [])
-        return sorted(str(model["name"]) for model in models if "name" in model)
+        try:
+            payload = self._ensure_client().list()
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            if self._is_response_error(exc):
+                raise RuntimeError(
+                    f"Ollama request failed: {self._get_mapping_value(exc, 'error') or exc}"
+                ) from exc
+            raise RuntimeError(f"Failed to reach Ollama at {self.base_url}: {exc}") from exc
+
+        models = self._get_mapping_value(payload, "models") or []
+        names = []
+        for model in models:
+            name = self._get_mapping_value(model, "name")
+            if name:
+                names.append(str(name))
+        return sorted(names)
 
     def cleanup_transcript(
         self,
@@ -73,7 +89,7 @@ class OllamaClient:
             "stream": True,
             "options": {"temperature": 0},
         }
-        content = self._request_streamed_chat("/api/chat", payload, cancel_requested)
+        content = self._request_streamed_chat(payload, cancel_requested)
         data = json.loads(content)
 
         return TranscriptCleanup(
@@ -88,71 +104,66 @@ class OllamaClient:
 
     def _request_streamed_chat(
         self,
-        path: str,
         payload: dict[str, Any],
         cancel_requested: CancelCallback | None = None,
     ) -> str:
-        req = request.Request(
-            url=f"{self.base_url}{path}",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-
         content_parts: list[str] = []
+        stream: Any = None
         try:
-            with request.urlopen(req, timeout=30) as response:
-                while True:
-                    if cancel_requested is not None and cancel_requested():
-                        response.close()
-                        raise ProcessingCancelledError()
+            stream = self._ensure_client().chat(**payload)
+            for chunk in stream:
+                if cancel_requested is not None and cancel_requested():
+                    raise ProcessingCancelledError()
 
-                    raw_line = response.readline()
-                    if not raw_line:
-                        break
+                message = self._get_mapping_value(chunk, "message")
+                part = self._get_mapping_value(message, "content") if message else ""
+                if part:
+                    content_parts.append(str(part))
 
-                    line = raw_line.decode("utf-8").strip()
-                    if not line:
-                        continue
-
-                    chunk = json.loads(line)
-                    if "error" in chunk:
-                        raise RuntimeError(str(chunk["error"]))
-
-                    message = chunk.get("message", {})
-                    part = message.get("content", "")
-                    if part:
-                        content_parts.append(str(part))
-
-                    if chunk.get("done"):
-                        break
-        except error.URLError as exc:
+                if self._get_mapping_value(chunk, "done"):
+                    break
+        except ProcessingCancelledError:
+            raise
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            if self._is_response_error(exc):
+                raise RuntimeError(
+                    f"Ollama request failed: {self._get_mapping_value(exc, 'error') or exc}"
+                ) from exc
             raise RuntimeError(f"Failed to reach Ollama at {self.base_url}: {exc}") from exc
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("Ollama returned invalid streaming JSON.") from exc
+        finally:
+            if stream is not None and hasattr(stream, "close"):
+                stream.close()
 
         if cancel_requested is not None and cancel_requested():
             raise ProcessingCancelledError()
 
         return "".join(content_parts)
 
-    def _request_json(self, path: str, payload: dict[str, Any] | None) -> dict[str, Any]:
-        body = None
-        headers = {"Content-Type": "application/json"}
-        if payload is not None:
-            body = json.dumps(payload).encode("utf-8")
+    @staticmethod
+    def _get_mapping_value(value: Any, key: str) -> Any:
+        if isinstance(value, dict):
+            return value.get(key)
+        return getattr(value, key, None)
 
-        req = request.Request(
-            url=f"{self.base_url}{path}",
-            data=body,
-            headers=headers,
-            method="POST" if payload is not None else "GET",
-        )
+    def _ensure_client(self) -> Any:
+        if self._client is not None:
+            return self._client
 
         try:
-            with request.urlopen(req, timeout=30) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except error.URLError as exc:
-            raise RuntimeError(f"Failed to reach Ollama at {self.base_url}: {exc}") from exc
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("Ollama returned invalid JSON.") from exc
+            ollama_module = import_module("ollama")
+        except ImportError as exc:
+            raise RuntimeError(
+                "The Python package 'ollama' is not installed. Run `uv sync` to install it."
+            ) from exc
+
+        self._client = ollama_module.Client(host=self.base_url)
+        return self._client
+
+    @staticmethod
+    def _is_response_error(exc: Exception) -> bool:
+        return (
+            exc.__class__.__name__ == "ResponseError"
+            and exc.__class__.__module__.split(".", 1)[0] == "ollama"
+        )
