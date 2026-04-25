@@ -46,6 +46,9 @@ WHISPER_MODELS = [
     "distil-large-v3",
 ]
 
+LIVE_TRANSCRIPTION_INTERVAL_MS = 900
+LIVE_TRANSCRIPTION_MIN_DURATION_SECONDS = 0.6
+
 
 @dataclass(slots=True)
 class HistoryEntry:
@@ -55,6 +58,13 @@ class HistoryEntry:
     @property
     def display_text(self) -> str:
         return self.result.cleaned_text or self.result.raw_text
+
+
+@dataclass(slots=True)
+class LiveTranscriptionUpdate:
+    session_id: int
+    text: str
+    detected_language: str | None
 
 
 class PipelineWorker(QObject):
@@ -106,12 +116,64 @@ class PipelineWorker(QObject):
         self.finished.emit(result)
 
 
+class LiveTranscriptionWorker(QObject):
+    finished = Signal(object)
+    error = Signal(str)
+    cancelled = Signal()
+
+    def __init__(self, transcriber: FasterWhisperTranscriber) -> None:
+        super().__init__()
+        self.transcriber = transcriber
+        self._cancel_event = threading.Event()
+
+    @Slot()
+    def cancel_current(self) -> None:
+        self._cancel_event.set()
+
+    @Slot(object, str, object, int)
+    def process_snapshot(
+        self,
+        recorded_audio: RecordedAudio,
+        whisper_model: str,
+        language: str | None,
+        session_id: int,
+    ) -> None:
+        self._cancel_event.clear()
+        try:
+            self.transcriber.set_model_name(whisper_model)
+            transcription = self.transcriber.transcribe(
+                recorded_audio.path,
+                language=language,
+                cancel_requested=self._cancel_event.is_set,
+            )
+        except ProcessingCancelledError:
+            self.cancelled.emit()
+            return
+        except Exception as exc:
+            self.error.emit(str(exc))
+            return
+        finally:
+            _unlink_file(recorded_audio.path)
+
+        self.finished.emit(
+            LiveTranscriptionUpdate(
+                session_id=session_id,
+                text=transcription.raw_text,
+                detected_language=transcription.detected_language,
+            )
+        )
+
+
 class MainWindow(QMainWindow):
+    request_live_transcription = Signal(object, str, object, int)
+    cancel_live_transcription = Signal()
+
     def __init__(self, config: AppConfig) -> None:
         super().__init__()
         self.config = config
         self.recorder = MicrophoneRecorder(sample_rate=config.sample_rate)
         self.transcriber = FasterWhisperTranscriber(config.whisper_model)
+        self.live_transcriber = FasterWhisperTranscriber(config.whisper_model)
         self.ollama_client = OllamaClient(config.ollama_base_url)
         self.pipeline = Talk2TextPipeline(self.transcriber, self.ollama_client)
 
@@ -122,10 +184,27 @@ class MainWindow(QMainWindow):
         self._history_entries: list[HistoryEntry] = []
         self._current_transcript_text = ""
         self._is_processing = False
+        self._live_session_id = 0
+        self._live_request_in_flight = False
+        self._pending_final_audio: RecordedAudio | None = None
         self._nav_buttons: list[QToolButton] = []
 
         self.elapsed_timer = QTimer(self)
         self.elapsed_timer.timeout.connect(self._update_recording_clock)
+        self.live_timer = QTimer(self)
+        self.live_timer.setInterval(LIVE_TRANSCRIPTION_INTERVAL_MS)
+        self.live_timer.timeout.connect(self._queue_live_transcription)
+
+        self._live_thread = QThread(self)
+        self._live_worker = LiveTranscriptionWorker(self.live_transcriber)
+        self._live_worker.moveToThread(self._live_thread)
+        self.request_live_transcription.connect(self._live_worker.process_snapshot)
+        self.cancel_live_transcription.connect(self._live_worker.cancel_current)
+        self._live_worker.finished.connect(self._handle_live_update)
+        self._live_worker.error.connect(self._handle_live_error)
+        self._live_worker.cancelled.connect(self._handle_live_cancelled)
+        self._live_thread.finished.connect(self._live_worker.deleteLater)
+        self._live_thread.start()
 
         self.setWindowTitle("Talk2Text")
         self.setFixedSize(300, 400)
@@ -539,11 +618,17 @@ class MainWindow(QMainWindow):
         return QIcon(pixmap)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        self.live_timer.stop()
+        self.cancel_live_transcription.emit()
+        if self._worker is not None:
+            self._worker.cancel()
         if self.recorder.is_recording:
             try:
                 self.recorder.stop()
             except Exception:
                 pass
+        self._live_thread.quit()
+        self._live_thread.wait(2000)
         super().closeEvent(event)
 
     def _show_main_page(self) -> None:
@@ -636,9 +721,16 @@ class MainWindow(QMainWindow):
             self._start_recording()
 
     def _cancel_processing(self) -> None:
-        if self._worker is None:
+        if self._worker is not None:
+            self._worker.cancel()
+        elif self._pending_final_audio is not None:
+            self._pending_final_audio = None
+            if self._live_request_in_flight:
+                self.cancel_live_transcription.emit()
+            else:
+                self._handle_cancelled("Processing cancelled.")
+        else:
             return
-        self._worker.cancel()
         self.prompt_label.setText("Cancelling...")
         self._set_status("Cancelling transcription...")
         self._set_record_button_mode("working", "...")
@@ -650,14 +742,21 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Recording Error", str(exc))
             return
 
+        self._live_session_id += 1
+        self._pending_final_audio = None
+        self._last_result = None
         self._recording_started_at = time.monotonic()
         self.elapsed_timer.start(250)
+        self.live_timer.start()
+        QTimer.singleShot(300, self._queue_live_transcription)
+        self._show_placeholder_transcript("Listening...")
         self.prompt_label.setText("Tap again to stop")
-        self._set_status("Recording...")
+        self._set_status("Recording with live transcription...")
         self._set_record_button_mode("recording", "STOP")
         self._set_navigation_enabled(False)
 
     def _stop_recording(self) -> None:
+        self.live_timer.stop()
         try:
             recorded_audio = self.recorder.stop()
         except Exception as exc:
@@ -667,10 +766,54 @@ class MainWindow(QMainWindow):
 
         self.elapsed_timer.stop()
         self.recording_clock.setText("00:00")
+        self._live_session_id += 1
+        self._pending_final_audio = recorded_audio
         self._is_processing = True
+        self.prompt_label.setText("Finalizing...")
+        self._set_status("Stopping recording and finalizing transcript...")
+        self._set_record_button_mode("cancel", "ABORT")
+        if self._live_request_in_flight:
+            self.cancel_live_transcription.emit()
+            return
+        self._start_pending_final_processing()
+
+    def _queue_live_transcription(self) -> None:
+        if not self.recorder.is_recording or self._is_processing or self._live_request_in_flight:
+            return
+
+        try:
+            snapshot = self.recorder.snapshot()
+        except RuntimeError as exc:
+            if "No microphone audio" in str(exc):
+                return
+            self._set_status(f"Live transcription paused: {exc}")
+            return
+        except Exception as exc:
+            self._set_status(f"Live transcription failed: {exc}")
+            return
+
+        if snapshot.duration_seconds < LIVE_TRANSCRIPTION_MIN_DURATION_SECONDS:
+            _unlink_file(snapshot.path)
+            return
+
+        self._live_request_in_flight = True
+        self.request_live_transcription.emit(
+            snapshot,
+            self._selected_whisper_model(),
+            self._selected_language(),
+            self._live_session_id,
+        )
+
+    def _start_pending_final_processing(self) -> None:
+        if self._pending_final_audio is None:
+            return
+        if self.recorder.is_recording or self._live_request_in_flight or self._worker is not None:
+            return
+
+        recorded_audio = self._pending_final_audio
+        self._pending_final_audio = None
         self.prompt_label.setText("Transcribing...")
         self._set_status("Working on your transcript...")
-        self._set_record_button_mode("cancel", "ABORT")
         self._run_pipeline(recorded_audio)
 
     def _run_pipeline(self, recorded_audio: RecordedAudio) -> None:
@@ -696,6 +839,33 @@ class MainWindow(QMainWindow):
         self._worker_thread.finished.connect(self._worker_thread.deleteLater)
         self._worker_thread.finished.connect(self._clear_worker_state)
         self._worker_thread.start()
+
+    @Slot(object)
+    def _handle_live_update(self, update: LiveTranscriptionUpdate) -> None:
+        self._live_request_in_flight = False
+        if update.session_id != self._live_session_id or not self.recorder.is_recording:
+            self._maybe_continue_after_live_worker()
+            return
+        if not update.text.strip():
+            self._maybe_continue_after_live_worker()
+            return
+
+        self._show_transcript(update.text)
+        if update.detected_language:
+            self._set_status(f"Recording... detected {update.detected_language}.")
+        self._maybe_continue_after_live_worker()
+
+    @Slot(str)
+    def _handle_live_error(self, message: str) -> None:
+        self._live_request_in_flight = False
+        if self.recorder.is_recording:
+            self._set_status(f"Live transcription skipped: {message}")
+        self._maybe_continue_after_live_worker()
+
+    @Slot()
+    def _handle_live_cancelled(self) -> None:
+        self._live_request_in_flight = False
+        self._maybe_continue_after_live_worker()
 
     def _copy_transcript_to_clipboard(self) -> None:
         if not self._current_transcript_text:
@@ -778,7 +948,9 @@ class MainWindow(QMainWindow):
 
     def _set_idle_state(self) -> None:
         self.elapsed_timer.stop()
+        self.live_timer.stop()
         self._recording_started_at = None
+        self._pending_final_audio = None
         self.recording_clock.setText("00:00")
         self.prompt_label.setText("Tap once to start")
         self._set_record_button_mode("idle", "REC")
@@ -808,6 +980,20 @@ class MainWindow(QMainWindow):
         self._worker = None
         self._worker_thread = None
 
+    @Slot()
+    def _maybe_continue_after_live_worker(self) -> None:
+        if self._pending_final_audio is not None and not self.recorder.is_recording and not self._live_request_in_flight and self._worker is None:
+            self._start_pending_final_processing()
+            return
+        if (
+            self._is_processing
+            and self._pending_final_audio is None
+            and not self.recorder.is_recording
+            and not self._live_request_in_flight
+            and self._worker is None
+        ):
+            self._handle_cancelled("Processing cancelled.")
+
     def _update_recording_clock(self) -> None:
         if self._recording_started_at is None:
             self.recording_clock.setText("00:00")
@@ -823,3 +1009,10 @@ def main() -> int:
     window = MainWindow(AppConfig.from_env())
     window.show()
     return app.exec()
+
+
+def _unlink_file(path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:
+        pass

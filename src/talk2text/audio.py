@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import tempfile
+import threading
 import wave
 
 from PySide6.QtCore import QIODevice
@@ -15,6 +16,7 @@ class MicrophoneRecorder:
         self.sample_rate = sample_rate
         self.channels = channels
         self._buffer = bytearray()
+        self._buffer_lock = threading.Lock()
         self._audio_source: QAudioSource | None = None
         self._io_device: QIODevice | None = None
         self._audio_format: QAudioFormat | None = None
@@ -39,12 +41,23 @@ class MicrophoneRecorder:
         if io_device is None:
             raise RuntimeError("Qt failed to start microphone capture.")
 
-        self._buffer.clear()
+        with self._buffer_lock:
+            self._buffer.clear()
         self._device_id = device_id
         self._audio_format = audio_format
         self._audio_source = audio_source
         self._io_device = io_device
         self._io_device.readyRead.connect(self._pull_audio)
+
+    def snapshot(self) -> RecordedAudio:
+        if self._audio_source is None or self._io_device is None or self._audio_format is None:
+            raise RuntimeError("Recording has not started.")
+
+        self._pull_audio()
+        with self._buffer_lock:
+            payload = bytes(self._buffer)
+
+        return _recorded_audio_from_payload(payload, self._audio_format)
 
     def stop(self) -> RecordedAudio:
         if self._audio_source is None or self._io_device is None or self._audio_format is None:
@@ -67,32 +80,11 @@ class MicrophoneRecorder:
         audio_source.stop()
         self._pull_audio()
 
-        if not self._buffer:
-            raise RuntimeError("No microphone audio was captured.")
+        with self._buffer_lock:
+            payload = bytes(self._buffer)
+            self._buffer.clear()
 
-        bytes_per_sample = _bytes_per_sample(audio_format)
-        frame_size = max(1, bytes_per_sample * audio_format.channelCount())
-        duration_seconds = len(self._buffer) / float(audio_format.sampleRate() * frame_size)
-        if duration_seconds <= 0:
-            raise RuntimeError("Recorded audio is empty.")
-
-        payload = bytes(self._buffer)
-        self._buffer.clear()
-
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
-            path = Path(handle.name)
-
-        with wave.open(str(path), "wb") as wav_file:
-            wav_file.setnchannels(audio_format.channelCount())
-            wav_file.setsampwidth(bytes_per_sample)
-            wav_file.setframerate(audio_format.sampleRate())
-            wav_file.writeframes(payload)
-
-        return RecordedAudio(
-            path=path,
-            sample_rate=audio_format.sampleRate(),
-            duration_seconds=duration_seconds,
-        )
+        return _recorded_audio_from_payload(payload, audio_format)
 
     def _pull_audio(self) -> None:
         if self._io_device is None:
@@ -100,7 +92,8 @@ class MicrophoneRecorder:
 
         chunk = self._io_device.readAll()
         if chunk:
-            self._buffer.extend(bytes(chunk))
+            with self._buffer_lock:
+                self._buffer.extend(bytes(chunk))
 
 
 def list_input_devices() -> list[InputDevice]:
@@ -199,3 +192,29 @@ def _bytes_per_sample(audio_format: QAudioFormat) -> int:
     if sample_format in {QAudioFormat.SampleFormat.Int32, QAudioFormat.SampleFormat.Float}:
         return 4
     raise RuntimeError(f"Unsupported audio sample format: {sample_format}")
+
+
+def _recorded_audio_from_payload(payload: bytes, audio_format: QAudioFormat) -> RecordedAudio:
+    if not payload:
+        raise RuntimeError("No microphone audio was captured.")
+
+    bytes_per_sample = _bytes_per_sample(audio_format)
+    frame_size = max(1, bytes_per_sample * audio_format.channelCount())
+    duration_seconds = len(payload) / float(audio_format.sampleRate() * frame_size)
+    if duration_seconds <= 0:
+        raise RuntimeError("Recorded audio is empty.")
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
+        path = Path(handle.name)
+
+    with wave.open(str(path), "wb") as wav_file:
+        wav_file.setnchannels(audio_format.channelCount())
+        wav_file.setsampwidth(bytes_per_sample)
+        wav_file.setframerate(audio_format.sampleRate())
+        wav_file.writeframes(payload)
+
+    return RecordedAudio(
+        path=path,
+        sample_rate=audio_format.sampleRate(),
+        duration_seconds=duration_seconds,
+    )

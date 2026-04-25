@@ -16,6 +16,8 @@ class FasterWhisperTranscriber:
         self._model = None
         self._backend_note = ""
         self._lock = threading.Lock()
+        self._inference_lock = threading.Lock()
+        self._owner_thread_id: int | None = None
 
     @property
     def model_name(self) -> str:
@@ -29,6 +31,7 @@ class FasterWhisperTranscriber:
             self._model_name = model_name
             self._model = None
             self._backend_note = ""
+            self._owner_thread_id = None
 
     def transcribe(
         self,
@@ -36,43 +39,53 @@ class FasterWhisperTranscriber:
         language: str | None = None,
         cancel_requested: CancelCallback | None = None,
     ) -> TranscriptionOutput:
-        model = self._ensure_model()
-        kwargs = {
-            "beam_size": 1,
-            "condition_on_previous_text": False,
-            "vad_filter": True,
-        }
-        if language:
-            kwargs["language"] = language
+        with self._inference_lock:
+            model = self._ensure_model()
+            kwargs = {
+                "beam_size": 1,
+                "condition_on_previous_text": False,
+                "vad_filter": True,
+            }
+            if language:
+                kwargs["language"] = language
 
-        segments, info = model.transcribe(str(audio_path), **kwargs)
-        segment_list = []
-        for segment in segments:
-            if cancel_requested is not None and cancel_requested():
-                raise ProcessingCancelledError()
-            segment_list.append(segment)
+            segments, info = model.transcribe(str(audio_path), **kwargs)
+            segment_list = []
+            for segment in segments:
+                if cancel_requested is not None and cancel_requested():
+                    raise ProcessingCancelledError()
+                segment_list.append(segment)
 
-        raw_text = " ".join(segment.text.strip() for segment in segment_list if segment.text.strip()).strip()
+            raw_text = " ".join(
+                segment.text.strip() for segment in segment_list if segment.text.strip()
+            ).strip()
 
-        notes = [self._backend_note]
-        if getattr(info, "language_probability", None) is not None and getattr(info, "language", None):
-            notes.append(
-                f"Detected language {info.language} with confidence {info.language_probability:.2f}"
+            notes = [self._backend_note]
+            if getattr(info, "language_probability", None) is not None and getattr(
+                info, "language", None
+            ):
+                notes.append(
+                    f"Detected language {info.language} with confidence {info.language_probability:.2f}"
+                )
+
+            return TranscriptionOutput(
+                raw_text=raw_text,
+                detected_language=getattr(info, "language", None),
+                notes=notes,
             )
 
-        return TranscriptionOutput(
-            raw_text=raw_text,
-            detected_language=getattr(info, "language", None),
-            notes=notes,
-        )
-
     def _ensure_model(self):
-        if self._model is not None:
+        current_thread_id = threading.get_ident()
+        if self._model is not None and self._owner_thread_id == current_thread_id:
             return self._model
 
         with self._lock:
-            if self._model is not None:
+            if self._model is not None and self._owner_thread_id == current_thread_id:
                 return self._model
+            if self._model is not None and self._owner_thread_id != current_thread_id:
+                self._model = None
+                self._backend_note = ""
+                self._owner_thread_id = None
 
             from faster_whisper import WhisperModel
 
@@ -84,6 +97,7 @@ class FasterWhisperTranscriber:
                         device=device,
                         compute_type=compute_type,
                     )
+                    self._owner_thread_id = current_thread_id
                     self._backend_note = f"Loaded {self._model_name} on {device} ({compute_type})"
                     return self._model
                 except Exception as exc:  # pragma: no cover - hardware dependent
