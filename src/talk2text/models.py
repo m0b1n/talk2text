@@ -57,3 +57,13 @@ class TranscriptionResult:
     notes: list[str]
     audio_path: Path | None
     duration_seconds: float
+
+
+@dataclass(slots=True)
+class HistoryEntry:
+    created_at: str
+    result: TranscriptionResult
+
+    @property
+    def display_text(self) -> str:
+        return self.result.cleaned_text or self.result.raw_text

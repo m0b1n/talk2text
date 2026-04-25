@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import sys
 import time
-from dataclasses import dataclass
 from datetime import datetime
 from multiprocessing import freeze_support
 
@@ -17,7 +16,14 @@ from PySide6.QtWidgets import (
 
 from .audio import MicrophoneRecorder, list_input_devices
 from .config import AppConfig
-from .models import CleanupUpdate, LiveTranscriptionUpdate, RecordedAudio, TranscriptionResult
+from .history_store import load_history_entries, save_history_entries
+from .models import (
+    CleanupUpdate,
+    HistoryEntry,
+    LiveTranscriptionUpdate,
+    RecordedAudio,
+    TranscriptionResult,
+)
 from .ollama_client import OllamaClient
 from .ui_layout import build_ui
 from .worker_client import ProcessWorkerClient
@@ -39,16 +45,6 @@ LIVE_VOICE_MEAN_ABS_THRESHOLD = 120
 LIVE_VOICE_PEAK_ABS_THRESHOLD = 800
 LIVE_LANGUAGE_LOCK_MIN_DURATION_SECONDS = 2.0
 LIVE_LANGUAGE_LOCK_MIN_WORDS = 3
-
-
-@dataclass(slots=True)
-class HistoryEntry:
-    created_at: str
-    result: TranscriptionResult
-
-    @property
-    def display_text(self) -> str:
-        return self.result.cleaned_text or self.result.raw_text
 
 
 class MainWindow(QMainWindow):
@@ -97,6 +93,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Talk2Text")
         self.setFixedSize(300, 400)
         build_ui(self, self.config, WHISPER_MODELS)
+        self._load_persistent_history()
         self._load_input_devices()
         self._load_ollama_models()
         self._show_placeholder_transcript("Tap the red button to record.")
@@ -472,6 +469,7 @@ class MainWindow(QMainWindow):
     def _clear_history(self) -> None:
         self._history_entries.clear()
         self.history_list.clear()
+        self._persist_history()
         self._set_status("History cleared.")
 
     @Slot(object)
@@ -501,6 +499,7 @@ class MainWindow(QMainWindow):
 
         self._show_transcript(update.cleanup.cleaned_text)
         self._sync_history_list()
+        self._persist_history()
         self._is_processing = False
         self._set_idle_state()
         self._set_status(f"Polished with {update.model_name} in {update.elapsed_seconds:.1f}s.")
@@ -541,11 +540,12 @@ class MainWindow(QMainWindow):
 
     def _add_history_entry(self, result: TranscriptionResult) -> None:
         entry = HistoryEntry(
-            created_at=datetime.now().strftime("%H:%M"),
+            created_at=datetime.now().strftime("%m-%d %H:%M"),
             result=result,
         )
         self._history_entries.insert(0, entry)
         self._sync_history_list()
+        self._persist_history()
 
     def _sync_history_list(self) -> None:
         self.history_list.clear()
@@ -558,6 +558,16 @@ class MainWindow(QMainWindow):
             item.setToolTip(entry.display_text)
             item.setData(Qt.ItemDataRole.UserRole, index)
             self.history_list.addItem(item)
+
+    def _load_persistent_history(self) -> None:
+        self._history_entries = load_history_entries()
+        self._sync_history_list()
+
+    def _persist_history(self) -> None:
+        try:
+            save_history_entries(self._history_entries)
+        except Exception as exc:
+            self._set_status(f"Could not save history: {exc}")
 
     def _show_transcript(self, text: str) -> None:
         self._current_transcript_text = text.strip()

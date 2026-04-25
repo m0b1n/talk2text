@@ -13,11 +13,11 @@ What works today:
 - local Whisper transcription
 - optional live transcription
 - manual Ollama transcript polish
-- session history inside the app
+- transcript history persisted locally
 
 What is still rough:
 
-- no persistent settings/history storage yet
+- no persistent settings storage yet
 - no global push-to-talk yet
 - limited automated coverage around GUI behavior
 
