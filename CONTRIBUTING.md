@@ -26,7 +26,7 @@ python3 -m compileall src tests
 - Keep Ubuntu desktop behavior working first. This project is Linux-first.
 - Prefer small, reviewable commits.
 - Add or update tests when you change behavior.
-- Do not commit build artifacts, local models, or `.deb` outputs.
+- Do not commit build artifacts or local model caches.
 - Keep Ollama optional and off the critical path unless the change explicitly targets it.
 
 ## Pull Requests

@@ -1,6 +1,6 @@
 # Talk2Text
 
-Talk2Text is a local Ubuntu desktop app for microphone transcription.
+Talk2Text is a local Python app for microphone transcription.
 It records audio with Qt, transcribes it locally with `faster-whisper`, and can optionally send the finished transcript to a local Ollama model for cleanup.
 
 ## Status
@@ -14,7 +14,6 @@ What works today:
 - optional live transcription
 - manual Ollama transcript polish
 - session history inside the app
-- Debian package build helper
 
 What is still rough:
 
@@ -54,6 +53,17 @@ Alternative launch command:
 PYTHONPATH=src python3 -m talk2text
 ```
 
+## Install For Your User
+
+If you want `talk2text` available from your shell without activating a virtual environment:
+
+```bash
+python3 -m pip install --user .
+talk2text
+```
+
+If `talk2text` is not found afterward, ensure `~/.local/bin` is on your `PATH`.
+
 ## Default Behavior
 
 - Whisper model: `turbo`
@@ -74,19 +84,6 @@ export TALK2TEXT_LIVE_TRANSCRIPTION=0
 ```
 
 Leave `TALK2TEXT_LANGUAGE` empty for language auto-detection.
-
-## Packaging
-
-The repo includes a Debian packaging path based on `pyside6-deploy`.
-
-```bash
-sudo apt install patchelf
-chmod +x build-deb.sh
-./build-deb.sh
-sudo apt install ./talk2text_0.1.0-1_amd64.deb
-```
-
-More detail is documented in [docs/deb-packaging.md](docs/deb-packaging.md).
 
 ## Development
 
