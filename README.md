@@ -2,7 +2,7 @@
 
 Local Ubuntu desktop speech-to-text app with:
 
-- microphone capture via `sounddevice`
+- microphone capture via `Qt Multimedia`
 - transcription via `faster-whisper`
 - optional transcript cleanup and action extraction via local Ollama
 
@@ -28,7 +28,7 @@ Ubuntu packages:
 
 ```bash
 sudo apt update
-sudo apt install python3-venv portaudio19-dev
+sudo apt install python3-venv
 ```
 
 If you want GPU acceleration for `faster-whisper`, ensure your NVIDIA CUDA 12 and cuDNN 9 stack is working. CPU fallback is built into the app.
@@ -79,7 +79,6 @@ Leave `TALK2TEXT_LANGUAGE` empty to auto-detect.
 
 ## Notes
 
-- Recording uses the default input device unless you pick another one in the UI.
+- Recording uses Qt's native audio stack and the default input device unless you pick another one in the UI.
 - Transcription uses `vad_filter=True` to trim silence.
 - Ollama cleanup is optional. If it fails, the raw transcription is still shown.
-

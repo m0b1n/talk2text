@@ -6,7 +6,7 @@ from pathlib import Path
 
 @dataclass(slots=True)
 class InputDevice:
-    device_id: int
+    device_id: str
     name: str
     is_default: bool = False
 
@@ -42,4 +42,3 @@ class TranscriptionResult:
     notes: list[str]
     audio_path: Path
     duration_seconds: float
-

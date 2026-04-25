@@ -238,11 +238,11 @@ class MainWindow(QMainWindow):
     def _selected_whisper_model(self) -> str:
         return self.whisper_model_combo.currentText().strip()
 
-    def _selected_device_id(self) -> int | None:
+    def _selected_device_id(self) -> str | None:
         data = self.device_combo.currentData()
         if data is None:
             return None
-        return int(data)
+        return str(data)
 
     def _load_input_devices(self) -> None:
         try:
