@@ -1,96 +1,67 @@
 # Talk2Text
 
-Local Ubuntu desktop speech-to-text app with:
+Talk2Text is a local Ubuntu desktop app for microphone transcription.
+It records audio with Qt, transcribes it locally with `faster-whisper`, and can optionally send the finished transcript to a local Ollama model for cleanup.
 
-- microphone capture via `Qt Multimedia`
-- transcription via `faster-whisper`
-- optional transcript cleanup and action extraction via local Ollama
+## Status
 
-## What this MVP does
+This project is an Ubuntu-focused MVP.
 
-1. Record from your microphone
-2. Save the utterance to a temporary WAV file
-3. Transcribe locally with Whisper
-4. Optionally send the raw transcript to Ollama for:
-   - punctuation and cleanup
-   - one-line summary
-   - extracted action items or commands
+What works today:
 
-The flow is:
+- microphone recording through Qt Multimedia
+- local Whisper transcription
+- optional live transcription
+- manual Ollama transcript polish
+- session history inside the app
+- Debian package build helper
+
+What is still rough:
+
+- no persistent settings/history storage yet
+- no global push-to-talk yet
+- limited automated coverage around GUI behavior
+
+## Architecture
 
 ```text
-microphone -> faster-whisper -> transcript -> Ollama
+microphone -> Qt audio capture -> faster-whisper -> transcript
+                                             \
+                                              -> optional Ollama polish
 ```
 
-## System dependencies
+## Requirements
 
-Ubuntu packages:
+- Ubuntu
+- Python 3.12
+- `python3-venv`
+- local Ollama installation if you want transcript polish
 
-```bash
-sudo apt update
-sudo apt install python3-venv
-```
+For GPU acceleration, a working NVIDIA CUDA 12 + cuDNN 9 stack is recommended.
+The app can fall back to CPU transcription.
 
-If you want GPU acceleration for `faster-whisper`, ensure your NVIDIA CUDA 12 and cuDNN 9 stack is working. CPU fallback is built into the app.
-
-## Install
+## Quick Start
 
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -e .
-```
-
-## Run
-
-```bash
 .venv/bin/talk2text
 ```
 
-Or:
+Alternative launch command:
 
 ```bash
 PYTHONPATH=src python3 -m talk2text
 ```
 
-## Build A `.deb`
-
-The repo includes a packaging helper around `pyside6-deploy`.
-
-Build the package with:
-
-```bash
-sudo apt install patchelf
-chmod +x build-deb.sh
-./build-deb.sh
-```
-
-That produces a file like:
-
-```text
-talk2text_0.1.0-1_amd64.deb
-```
-
-Install it with:
-
-```bash
-sudo apt install ./talk2text_0.1.0-1_amd64.deb
-```
-
-If you want to inspect or tweak the bundling step directly, the deploy config is in `pysidedeploy.spec`.
-
-## First-run behavior
-
-- The first Whisper run will download the selected transcription model if it is not already cached.
-- Ollama must already be running locally at `http://localhost:11434`.
-- The UI will try to list local Ollama models on startup.
-
-## Default choices
+## Default Behavior
 
 - Whisper model: `turbo`
 - Ollama model: `qwen3:8b`
-- Sample rate: `16000`
+- Live transcription: disabled by default
+- Ollama polish: disabled by default
 
-## Environment overrides
+## Environment Variables
 
 ```bash
 export TALK2TEXT_WHISPER_MODEL=large-v3
@@ -98,13 +69,62 @@ export TALK2TEXT_OLLAMA_MODEL=qwen3:8b
 export TALK2TEXT_OLLAMA_BASE_URL=http://localhost:11434
 export TALK2TEXT_LANGUAGE=
 export TALK2TEXT_SAMPLE_RATE=16000
-export TALK2TEXT_ENHANCE_WITH_OLLAMA=1
+export TALK2TEXT_ENHANCE_WITH_OLLAMA=0
+export TALK2TEXT_LIVE_TRANSCRIPTION=0
 ```
 
-Leave `TALK2TEXT_LANGUAGE` empty to auto-detect.
+Leave `TALK2TEXT_LANGUAGE` empty for language auto-detection.
 
-## Notes
+## Packaging
 
-- Recording uses Qt's native audio stack and the default input device unless you pick another one in the UI.
-- Transcription uses `vad_filter=True` to trim silence.
-- Ollama cleanup is optional. If it fails, the raw transcription is still shown.
+The repo includes a Debian packaging path based on `pyside6-deploy`.
+
+```bash
+sudo apt install patchelf
+chmod +x build-deb.sh
+./build-deb.sh
+sudo apt install ./talk2text_0.1.0-1_amd64.deb
+```
+
+More detail is documented in [docs/deb-packaging.md](docs/deb-packaging.md).
+
+## Development
+
+Install the package in editable mode:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -e ".[dev]"
+```
+
+Run checks:
+
+```bash
+python3 -m compileall src tests
+.venv/bin/python -m unittest discover -s tests
+```
+
+## Project Layout
+
+```text
+src/talk2text/
+  audio.py           Qt microphone capture
+  transcription.py   Whisper integration
+  ollama_client.py   Ollama cleanup client
+  pipeline.py        transcription pipeline
+  ui.py              desktop UI
+```
+
+## Troubleshooting
+
+- First Whisper use may download the selected model.
+- Ollama polish requires a local Ollama server running at `http://localhost:11434` unless you override it.
+- If live transcription feels heavy, keep it disabled and use record-then-transcribe mode.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+MIT. See [LICENSE](LICENSE).
