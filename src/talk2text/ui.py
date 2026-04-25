@@ -48,6 +48,8 @@ WHISPER_MODELS = [
 
 LIVE_TRANSCRIPTION_INTERVAL_MS = 900
 LIVE_TRANSCRIPTION_MIN_DURATION_SECONDS = 0.6
+LIVE_LANGUAGE_LOCK_MIN_DURATION_SECONDS = 2.0
+LIVE_LANGUAGE_LOCK_MIN_WORDS = 3
 
 
 @dataclass(slots=True)
@@ -65,6 +67,7 @@ class LiveTranscriptionUpdate:
     session_id: int
     text: str
     detected_language: str | None
+    duration_seconds: float
 
 
 class PipelineWorker(QObject):
@@ -160,6 +163,7 @@ class LiveTranscriptionWorker(QObject):
                 session_id=session_id,
                 text=transcription.raw_text,
                 detected_language=transcription.detected_language,
+                duration_seconds=recorded_audio.duration_seconds,
             )
         )
 
@@ -187,6 +191,7 @@ class MainWindow(QMainWindow):
         self._live_session_id = 0
         self._live_request_in_flight = False
         self._pending_final_audio: RecordedAudio | None = None
+        self._session_language_hint: str | None = None
         self._nav_buttons: list[QToolButton] = []
 
         self.elapsed_timer = QTimer(self)
@@ -643,6 +648,9 @@ class MainWindow(QMainWindow):
     def _selected_language(self) -> str | None:
         return self.language_input.text().strip() or None
 
+    def _active_language_hint(self) -> str | None:
+        return self._session_language_hint or self._selected_language()
+
     def _selected_ollama_model(self) -> str:
         return self.ollama_model_combo.currentText().strip()
 
@@ -744,6 +752,7 @@ class MainWindow(QMainWindow):
 
         self._live_session_id += 1
         self._pending_final_audio = None
+        self._session_language_hint = self._selected_language()
         self._last_result = None
         self._recording_started_at = time.monotonic()
         self.elapsed_timer.start(250)
@@ -800,7 +809,7 @@ class MainWindow(QMainWindow):
         self.request_live_transcription.emit(
             snapshot,
             self._selected_whisper_model(),
-            self._selected_language(),
+            self._active_language_hint(),
             self._live_session_id,
         )
 
@@ -824,7 +833,7 @@ class MainWindow(QMainWindow):
             whisper_model=self._selected_whisper_model(),
             use_ollama=self.enhance_checkbox.isChecked(),
             ollama_model=self._selected_ollama_model(),
-            language=self._selected_language(),
+            language=self._active_language_hint(),
         )
         self._worker.moveToThread(self._worker_thread)
         self._worker_thread.started.connect(self._worker.run)
@@ -850,8 +859,13 @@ class MainWindow(QMainWindow):
             self._maybe_continue_after_live_worker()
             return
 
+        language_locked = self._maybe_lock_session_language(update)
         self._show_transcript(update.text)
-        if update.detected_language:
+        if language_locked and self._session_language_hint is not None:
+            self._set_status(f"Recording... locked to {self._session_language_hint}.")
+        elif self._session_language_hint is not None:
+            self._set_status(f"Recording... using {self._session_language_hint}.")
+        elif update.detected_language:
             self._set_status(f"Recording... detected {update.detected_language}.")
         self._maybe_continue_after_live_worker()
 
@@ -946,11 +960,25 @@ class MainWindow(QMainWindow):
         self.transcript_label.setText(text)
         self.copy_button.setEnabled(False)
 
+    def _maybe_lock_session_language(self, update: LiveTranscriptionUpdate) -> bool:
+        if self._session_language_hint is not None:
+            return False
+        if not update.detected_language:
+            return False
+        if update.duration_seconds < LIVE_LANGUAGE_LOCK_MIN_DURATION_SECONDS:
+            return False
+        if len(update.text.split()) < LIVE_LANGUAGE_LOCK_MIN_WORDS:
+            return False
+
+        self._session_language_hint = update.detected_language
+        return True
+
     def _set_idle_state(self) -> None:
         self.elapsed_timer.stop()
         self.live_timer.stop()
         self._recording_started_at = None
         self._pending_final_audio = None
+        self._session_language_hint = None
         self.recording_clock.setText("00:00")
         self.prompt_label.setText("Tap once to start")
         self._set_record_button_mode("idle", "REC")
