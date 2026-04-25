@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 import threading
 
+from .errors import ProcessingCancelledError
 from .models import TranscriptionOutput
+
+CancelCallback = Callable[[], bool]
 
 
 class FasterWhisperTranscriber:
@@ -26,7 +30,12 @@ class FasterWhisperTranscriber:
             self._model = None
             self._backend_note = ""
 
-    def transcribe(self, audio_path: Path, language: str | None = None) -> TranscriptionOutput:
+    def transcribe(
+        self,
+        audio_path: Path,
+        language: str | None = None,
+        cancel_requested: CancelCallback | None = None,
+    ) -> TranscriptionOutput:
         model = self._ensure_model()
         kwargs = {
             "beam_size": 1,
@@ -37,7 +46,12 @@ class FasterWhisperTranscriber:
             kwargs["language"] = language
 
         segments, info = model.transcribe(str(audio_path), **kwargs)
-        segment_list = list(segments)
+        segment_list = []
+        for segment in segments:
+            if cancel_requested is not None and cancel_requested():
+                raise ProcessingCancelledError()
+            segment_list.append(segment)
+
         raw_text = " ".join(segment.text.strip() for segment in segment_list if segment.text.strip()).strip()
 
         notes = [self._backend_note]

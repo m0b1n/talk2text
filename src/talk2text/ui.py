@@ -1,32 +1,36 @@
 from __future__ import annotations
 
-from pathlib import Path
+from dataclasses import dataclass
+from datetime import datetime
 import sys
+import threading
 import time
 
 from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
-    QFileDialog,
-    QFormLayout,
-    QGridLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
-    QTextEdit,
+    QScrollArea,
+    QStackedWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from .audio import MicrophoneRecorder, list_input_devices
 from .config import AppConfig
+from .errors import ProcessingCancelledError
 from .models import RecordedAudio, TranscriptionResult
 from .ollama_client import OllamaClient
 from .pipeline import Talk2TextPipeline
@@ -43,9 +47,20 @@ WHISPER_MODELS = [
 ]
 
 
+@dataclass(slots=True)
+class HistoryEntry:
+    created_at: str
+    result: TranscriptionResult
+
+    @property
+    def display_text(self) -> str:
+        return self.result.cleaned_text or self.result.raw_text
+
+
 class PipelineWorker(QObject):
     finished = Signal(object)
     error = Signal(str)
+    cancelled = Signal(str)
     progress = Signal(str)
 
     def __init__(
@@ -64,6 +79,10 @@ class PipelineWorker(QObject):
         self.use_ollama = use_ollama
         self.ollama_model = ollama_model
         self.language = language
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
 
     @Slot()
     def run(self) -> None:
@@ -75,7 +94,11 @@ class PipelineWorker(QObject):
                 ollama_model=self.ollama_model,
                 language=self.language,
                 status_callback=self.progress.emit,
+                cancel_requested=self._cancel_event.is_set,
             )
+        except ProcessingCancelledError as exc:
+            self.cancelled.emit(str(exc))
+            return
         except Exception as exc:
             self.error.emit(str(exc))
             return
@@ -96,35 +119,288 @@ class MainWindow(QMainWindow):
         self._worker: PipelineWorker | None = None
         self._recording_started_at: float | None = None
         self._last_result: TranscriptionResult | None = None
+        self._history_entries: list[HistoryEntry] = []
+        self._current_transcript_text = ""
+        self._is_processing = False
+        self._nav_buttons: list[QToolButton] = []
 
         self.elapsed_timer = QTimer(self)
         self.elapsed_timer.timeout.connect(self._update_recording_clock)
 
         self.setWindowTitle("Talk2Text")
-        self.resize(1280, 760)
+        self.setFixedSize(300, 400)
         self._build_ui()
         self._load_input_devices()
         self._load_ollama_models()
+        self._show_placeholder_transcript("Tap the red button to record.")
+        self._set_status("Ready")
         self._set_idle_state()
 
     def _build_ui(self) -> None:
+        self.setStyleSheet(
+            """
+            QMainWindow {
+                background: #f5f1ea;
+            }
+            QWidget {
+                color: #30261d;
+                font-size: 11px;
+            }
+            QFrame#transcriptCard, QFrame#panelCard {
+                background: #fffdf8;
+                border: 1px solid #e5ddd1;
+                border-radius: 16px;
+            }
+            QLabel#statusPill {
+                background: #ece4d8;
+                border-radius: 10px;
+                color: #5f4f41;
+                padding: 4px 8px;
+                font-size: 10px;
+            }
+            QPushButton#recordButton {
+                background: #d84c4c;
+                border: 4px solid #f7d7d7;
+                border-radius: 42px;
+                color: white;
+                font-size: 13px;
+                font-weight: 700;
+            }
+            QPushButton#recordButton[mode="recording"] {
+                background: #8f2424;
+                border-color: #f3b9b9;
+            }
+            QPushButton#recordButton[mode="working"] {
+                background: #d9a6a6;
+                border-color: #f3d8d8;
+                color: #fff8f8;
+            }
+            QPushButton#recordButton[mode="cancel"] {
+                background: #db8c4a;
+                border-color: #f0d1b6;
+                color: #fff9f3;
+            }
+            QPushButton#copyButton, QPushButton#applyButton, QPushButton#clearHistoryButton {
+                background: #d8efe5;
+                border: none;
+                border-radius: 12px;
+                color: #245843;
+                font-size: 10px;
+                font-weight: 600;
+                padding: 6px 10px;
+            }
+            QPushButton#clearHistoryButton {
+                background: #f2e6da;
+                color: #7a5233;
+            }
+            QPushButton#refreshButton {
+                background: #efe7dc;
+                border: none;
+                border-radius: 10px;
+                color: #5f4f41;
+                font-size: 10px;
+                padding: 5px 8px;
+            }
+            QComboBox, QLineEdit {
+                background: white;
+                border: 1px solid #ded4c8;
+                border-radius: 10px;
+                padding: 6px 8px;
+                min-height: 16px;
+            }
+            QCheckBox {
+                spacing: 8px;
+            }
+            QListWidget {
+                background: white;
+                border: 1px solid #ded4c8;
+                border-radius: 12px;
+                padding: 4px;
+            }
+            QListWidget::item {
+                border-radius: 10px;
+                padding: 6px;
+                margin: 2px 0px;
+            }
+            QListWidget::item:selected {
+                background: #ece4d8;
+                color: #30261d;
+            }
+            QToolButton {
+                background: transparent;
+                border: none;
+                border-radius: 12px;
+                padding: 4px;
+                min-width: 24px;
+                min-height: 24px;
+            }
+            QToolButton:hover {
+                background: #ece4d8;
+            }
+            """
+        )
+
         root = QWidget(self)
         self.setCentralWidget(root)
 
         outer = QVBoxLayout(root)
-        outer.setContentsMargins(16, 16, 16, 16)
-        outer.setSpacing(12)
+        outer.setContentsMargins(0, 0, 0, 0)
 
-        settings_layout = QFormLayout()
-        settings_layout.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        self.stack = QStackedWidget()
+        outer.addWidget(self.stack)
+
+        self.main_page = self._build_main_page()
+        self.config_page = self._build_config_page()
+        self.history_page = self._build_history_page()
+
+        self.stack.addWidget(self.main_page)
+        self.stack.addWidget(self.config_page)
+        self.stack.addWidget(self.history_page)
+        self.stack.setCurrentWidget(self.main_page)
+
+    def _build_main_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        header = QHBoxLayout()
+        header.setSpacing(4)
+        self.config_button = self._make_icon_button(
+            theme_name="settings-configure",
+            fallback_text="",
+            tooltip="Settings",
+            handler=self._show_config_page,
+            fallback_icon=self._gear_icon(),
+        )
+        self.history_button = self._make_icon_button(
+            theme_name="document-open-recent",
+            fallback_text="H",
+            tooltip="History",
+            handler=self._show_history_page,
+        )
+        title = QLabel("Talk2Text")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setStyleSheet("font-size: 12px; font-weight: 700;")
+        header.addWidget(self.config_button)
+        header.addWidget(title, 1)
+        header.addWidget(self.history_button)
+        layout.addLayout(header)
+
+        self.main_status_label = QLabel()
+        self.main_status_label.setObjectName("statusPill")
+        self.main_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.main_status_label)
+
+        self.recording_clock = QLabel("00:00")
+        self.recording_clock.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.recording_clock.setStyleSheet("font-size: 10px; color: #8b7560;")
+        layout.addWidget(self.recording_clock)
+
+        layout.addStretch(1)
+
+        self.record_button = QPushButton("REC")
+        self.record_button.setObjectName("recordButton")
+        self.record_button.setFixedSize(84, 84)
+        self.record_button.clicked.connect(self._toggle_recording)
+        layout.addWidget(self.record_button, 0, Qt.AlignmentFlag.AlignHCenter)
+
+        self.prompt_label = QLabel("Tap once to start")
+        self.prompt_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.prompt_label.setStyleSheet("font-size: 10px; color: #6a5848;")
+        layout.addWidget(self.prompt_label)
+
+        transcript_card = QFrame()
+        transcript_card.setObjectName("transcriptCard")
+        transcript_layout = QVBoxLayout(transcript_card)
+        transcript_layout.setContentsMargins(10, 10, 10, 10)
+        transcript_layout.setSpacing(6)
+
+        transcript_title = QLabel("Transcript")
+        transcript_title.setStyleSheet("font-size: 10px; font-weight: 700; color: #6a5848;")
+        transcript_layout.addWidget(transcript_title)
+
+        transcript_scroll = QScrollArea()
+        transcript_scroll.setWidgetResizable(True)
+        transcript_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        transcript_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        transcript_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+        transcript_content = QWidget()
+        transcript_content_layout = QVBoxLayout(transcript_content)
+        transcript_content_layout.setContentsMargins(0, 0, 0, 0)
+        self.transcript_label = QLabel()
+        self.transcript_label.setWordWrap(True)
+        self.transcript_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.transcript_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self.transcript_label.setStyleSheet("font-size: 11px;")
+        transcript_content_layout.addWidget(self.transcript_label)
+        transcript_content_layout.addStretch(1)
+        transcript_scroll.setWidget(transcript_content)
+        transcript_layout.addWidget(transcript_scroll, 1)
+
+        layout.addWidget(transcript_card, 1)
+
+        copy_row = QHBoxLayout()
+        copy_row.addStretch(1)
+        self.copy_button = QPushButton("Copy")
+        self.copy_button.setObjectName("copyButton")
+        copy_icon = QIcon.fromTheme("edit-copy")
+        if not copy_icon.isNull():
+            self.copy_button.setIcon(copy_icon)
+        self.copy_button.clicked.connect(self._copy_transcript_to_clipboard)
+        copy_row.addWidget(self.copy_button)
+        layout.addLayout(copy_row)
+
+        return page
+
+    def _build_config_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        header = QHBoxLayout()
+        back_button = self._make_icon_button(
+            theme_name="go-previous",
+            fallback_text="<",
+            tooltip="Back",
+            handler=self._show_main_page,
+        )
+        header.addWidget(back_button)
+        config_title = QLabel("Settings")
+        config_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        config_title.setStyleSheet("font-size: 12px; font-weight: 700;")
+        header.addWidget(config_title, 1)
+        header.addSpacing(24)
+        layout.addLayout(header)
+
+        self.config_status_label = QLabel()
+        self.config_status_label.setObjectName("statusPill")
+        self.config_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.config_status_label)
+
+        card = QFrame()
+        card.setObjectName("panelCard")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(10, 10, 10, 10)
+        card_layout.setSpacing(8)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(8)
 
         self.device_combo = QComboBox()
         self.refresh_devices_button = QPushButton("Refresh Devices")
+        self.refresh_devices_button.setObjectName("refreshButton")
         self.refresh_devices_button.clicked.connect(self._load_input_devices)
-        device_row = QHBoxLayout()
-        device_row.addWidget(self.device_combo, 1)
-        device_row.addWidget(self.refresh_devices_button)
-        settings_layout.addRow("Input Device", device_row)
+        self._add_config_field(content_layout, "Input Device", self.device_combo, self.refresh_devices_button)
 
         self.whisper_model_combo = QComboBox()
         self.whisper_model_combo.setEditable(True)
@@ -132,94 +408,135 @@ class MainWindow(QMainWindow):
         if self.config.whisper_model not in WHISPER_MODELS:
             self.whisper_model_combo.addItem(self.config.whisper_model)
         self.whisper_model_combo.setCurrentText(self.config.whisper_model)
-        settings_layout.addRow("Whisper Model", self.whisper_model_combo)
+        self._add_config_field(content_layout, "Whisper Model", self.whisper_model_combo)
 
         self.language_input = QLineEdit(self.config.language or "")
         self.language_input.setPlaceholderText("Auto-detect")
-        settings_layout.addRow("Language Hint", self.language_input)
+        self._add_config_field(content_layout, "Language Hint", self.language_input)
 
         self.ollama_model_combo = QComboBox()
         self.ollama_model_combo.setEditable(True)
         self.ollama_model_combo.setCurrentText(self.config.ollama_model)
-        self.refresh_ollama_button = QPushButton("Refresh Ollama")
+        self.refresh_ollama_button = QPushButton("Refresh Models")
+        self.refresh_ollama_button.setObjectName("refreshButton")
         self.refresh_ollama_button.clicked.connect(self._load_ollama_models)
-        ollama_row = QHBoxLayout()
-        ollama_row.addWidget(self.ollama_model_combo, 1)
-        ollama_row.addWidget(self.refresh_ollama_button)
-        settings_layout.addRow("Ollama Model", ollama_row)
+        self._add_config_field(content_layout, "Ollama Model", self.ollama_model_combo, self.refresh_ollama_button)
 
         self.enhance_checkbox = QCheckBox("Enhance transcript with Ollama")
         self.enhance_checkbox.setChecked(self.config.enhance_with_ollama)
-        settings_layout.addRow("", self.enhance_checkbox)
+        content_layout.addWidget(self.enhance_checkbox)
 
-        outer.addLayout(settings_layout)
+        content_layout.addStretch(1)
+        scroll.setWidget(content)
+        card_layout.addWidget(scroll)
+        layout.addWidget(card, 1)
 
-        controls_row = QHBoxLayout()
-        controls_row.setSpacing(8)
+        self.apply_button = QPushButton("Apply")
+        self.apply_button.setObjectName("applyButton")
+        self.apply_button.clicked.connect(self._apply_settings)
+        layout.addWidget(self.apply_button)
 
-        self.start_button = QPushButton("Start Recording")
-        self.start_button.clicked.connect(self._start_recording)
-        controls_row.addWidget(self.start_button)
+        return page
 
-        self.stop_button = QPushButton("Stop Recording")
-        self.stop_button.clicked.connect(self._stop_recording)
-        controls_row.addWidget(self.stop_button)
+    def _build_history_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
 
-        self.save_button = QPushButton("Save Transcript")
-        self.save_button.clicked.connect(self._save_transcript)
-        controls_row.addWidget(self.save_button)
+        header = QHBoxLayout()
+        back_button = self._make_icon_button(
+            theme_name="go-previous",
+            fallback_text="<",
+            tooltip="Back",
+            handler=self._show_main_page,
+        )
+        header.addWidget(back_button)
+        history_title = QLabel("History")
+        history_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        history_title.setStyleSheet("font-size: 12px; font-weight: 700;")
+        header.addWidget(history_title, 1)
+        self.clear_history_button = QPushButton("Clear")
+        self.clear_history_button.setObjectName("clearHistoryButton")
+        self.clear_history_button.clicked.connect(self._clear_history)
+        header.addWidget(self.clear_history_button)
+        layout.addLayout(header)
 
-        controls_row.addStretch(1)
+        self.history_status_label = QLabel("Tap an item to load it on the main page.")
+        self.history_status_label.setObjectName("statusPill")
+        self.history_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.history_status_label)
 
-        self.recording_clock = QLabel("00:00")
-        self.recording_clock.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        controls_row.addWidget(self.recording_clock)
+        self.history_list = QListWidget()
+        self.history_list.itemClicked.connect(self._open_history_item)
+        self.history_list.itemActivated.connect(self._open_history_item)
+        layout.addWidget(self.history_list, 1)
 
-        outer.addLayout(controls_row)
+        return page
 
-        transcripts_layout = QGridLayout()
-        transcripts_layout.setSpacing(12)
+    def _add_config_field(
+        self,
+        parent_layout: QVBoxLayout,
+        label_text: str,
+        widget: QWidget,
+        extra_button: QPushButton | None = None,
+    ) -> None:
+        label = QLabel(label_text)
+        label.setStyleSheet("font-size: 10px; font-weight: 700; color: #6a5848;")
+        parent_layout.addWidget(label)
+        parent_layout.addWidget(widget)
+        if extra_button is not None:
+            parent_layout.addWidget(extra_button, 0, Qt.AlignmentFlag.AlignRight)
 
-        raw_label = QLabel("Raw Transcript")
-        transcripts_layout.addWidget(raw_label, 0, 0)
-        cleaned_label = QLabel("Processed Transcript")
-        transcripts_layout.addWidget(cleaned_label, 0, 1)
+    def _make_icon_button(
+        self,
+        theme_name: str,
+        fallback_text: str,
+        tooltip: str,
+        handler,
+        fallback_icon: QIcon | None = None,
+    ) -> QToolButton:
+        button = QToolButton()
+        button.setToolTip(tooltip)
+        icon = QIcon.fromTheme(theme_name)
+        if not icon.isNull():
+            button.setIcon(icon)
+        elif fallback_icon is not None:
+            button.setIcon(fallback_icon)
+        else:
+            button.setText(fallback_text)
+        button.clicked.connect(handler)
+        self._nav_buttons.append(button)
+        return button
 
-        self.raw_transcript = QTextEdit()
-        self.raw_transcript.setReadOnly(True)
-        transcripts_layout.addWidget(self.raw_transcript, 1, 0)
+    def _gear_icon(self) -> QIcon:
+        size = 18
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
 
-        self.cleaned_transcript = QTextEdit()
-        self.cleaned_transcript.setReadOnly(True)
-        transcripts_layout.addWidget(self.cleaned_transcript, 1, 1)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.translate(size / 2, size / 2)
 
-        summary_label = QLabel("Summary")
-        transcripts_layout.addWidget(summary_label, 2, 0)
-        actions_label = QLabel("Action Items")
-        transcripts_layout.addWidget(actions_label, 2, 1)
+        tooth_pen = QPen(QColor("#6a5848"))
+        tooth_pen.setWidthF(1.6)
+        tooth_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(tooth_pen)
 
-        self.summary_text = QTextEdit()
-        self.summary_text.setReadOnly(True)
-        self.summary_text.setFixedHeight(90)
-        transcripts_layout.addWidget(self.summary_text, 3, 0)
+        for angle in range(0, 360, 45):
+            painter.save()
+            painter.rotate(angle)
+            painter.drawLine(0, -7.5, 0, -5.0)
+            painter.restore()
 
-        self.action_list = QListWidget()
-        transcripts_layout.addWidget(self.action_list, 3, 1)
+        painter.setPen(QPen(QColor("#6a5848"), 1.6))
+        painter.setBrush(QColor("#ece4d8"))
+        painter.drawEllipse(-4.8, -4.8, 9.6, 9.6)
+        painter.setBrush(QColor("#f5f1ea"))
+        painter.drawEllipse(-1.7, -1.7, 3.4, 3.4)
+        painter.end()
 
-        outer.addLayout(transcripts_layout, 1)
-
-        self.status_label = QLabel("")
-        self.status_label.setWordWrap(True)
-        outer.addWidget(self.status_label)
-
-        self.notes_text = QTextEdit()
-        self.notes_text.setReadOnly(True)
-        self.notes_text.setFixedHeight(100)
-        outer.addWidget(self.notes_text)
-
-        save_action = QAction("Save Transcript", self)
-        save_action.triggered.connect(self._save_transcript)
-        self.addAction(save_action)
+        return QIcon(pixmap)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         if self.recorder.is_recording:
@@ -228,6 +545,15 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         super().closeEvent(event)
+
+    def _show_main_page(self) -> None:
+        self.stack.setCurrentWidget(self.main_page)
+
+    def _show_config_page(self) -> None:
+        self.stack.setCurrentWidget(self.config_page)
+
+    def _show_history_page(self) -> None:
+        self.stack.setCurrentWidget(self.history_page)
 
     def _selected_language(self) -> str | None:
         return self.language_input.text().strip() or None
@@ -251,6 +577,7 @@ class MainWindow(QMainWindow):
             self._set_status(f"Failed to query microphones: {exc}")
             return
 
+        current_device = self.config.audio_device or self._selected_device_id()
         self.device_combo.clear()
         for device in devices:
             label = device.name
@@ -258,17 +585,16 @@ class MainWindow(QMainWindow):
                 label = f"{label} (default)"
             self.device_combo.addItem(label, device.device_id)
 
-        if self.config.audio_device:
+        if current_device:
             for index in range(self.device_combo.count()):
-                label = self.device_combo.itemText(index)
-                if self.config.audio_device.lower() in label.lower():
+                if str(self.device_combo.itemData(index)) == current_device:
                     self.device_combo.setCurrentIndex(index)
                     break
 
         if not devices:
             self._set_status("No input device was found.")
         else:
-            self._set_status(f"Loaded {len(devices)} input device(s).")
+            self._set_status(f"Loaded {len(devices)} microphone(s).")
 
     def _load_ollama_models(self) -> None:
         current = self._selected_ollama_model() or self.config.ollama_model
@@ -291,6 +617,32 @@ class MainWindow(QMainWindow):
 
         self._set_status(f"Loaded {len(models)} Ollama model(s).")
 
+    def _apply_settings(self) -> None:
+        self.config.audio_device = self._selected_device_id()
+        self.config.whisper_model = self._selected_whisper_model()
+        self.config.language = self._selected_language()
+        self.config.ollama_model = self._selected_ollama_model()
+        self.config.enhance_with_ollama = self.enhance_checkbox.isChecked()
+        self._set_status("Settings updated.")
+        self._show_main_page()
+
+    def _toggle_recording(self) -> None:
+        if self._is_processing:
+            self._cancel_processing()
+            return
+        if self.recorder.is_recording:
+            self._stop_recording()
+        else:
+            self._start_recording()
+
+    def _cancel_processing(self) -> None:
+        if self._worker is None:
+            return
+        self._worker.cancel()
+        self.prompt_label.setText("Cancelling...")
+        self._set_status("Cancelling transcription...")
+        self._set_record_button_mode("working", "...")
+
     def _start_recording(self) -> None:
         try:
             self.recorder.start(device_id=self._selected_device_id())
@@ -300,9 +652,10 @@ class MainWindow(QMainWindow):
 
         self._recording_started_at = time.monotonic()
         self.elapsed_timer.start(250)
-        self.start_button.setEnabled(False)
-        self.stop_button.setEnabled(True)
-        self._set_status("Recording from microphone...")
+        self.prompt_label.setText("Tap again to stop")
+        self._set_status("Recording...")
+        self._set_record_button_mode("recording", "STOP")
+        self._set_navigation_enabled(False)
 
     def _stop_recording(self) -> None:
         try:
@@ -314,11 +667,10 @@ class MainWindow(QMainWindow):
 
         self.elapsed_timer.stop()
         self.recording_clock.setText("00:00")
-        self.start_button.setEnabled(False)
-        self.stop_button.setEnabled(False)
-        self._set_status(
-            f"Captured {recorded_audio.duration_seconds:.1f}s of audio. Starting transcription..."
-        )
+        self._is_processing = True
+        self.prompt_label.setText("Transcribing...")
+        self._set_status("Working on your transcript...")
+        self._set_record_button_mode("cancel", "ABORT")
         self._run_pipeline(recorded_audio)
 
     def _run_pipeline(self, recorded_audio: RecordedAudio) -> None:
@@ -336,81 +688,125 @@ class MainWindow(QMainWindow):
         self._worker.progress.connect(self._set_status)
         self._worker.finished.connect(self._handle_result)
         self._worker.error.connect(self._handle_error)
+        self._worker.cancelled.connect(self._handle_cancelled)
         self._worker.finished.connect(self._worker_thread.quit)
         self._worker.error.connect(self._worker_thread.quit)
+        self._worker.cancelled.connect(self._worker_thread.quit)
         self._worker_thread.finished.connect(self._worker.deleteLater)
         self._worker_thread.finished.connect(self._worker_thread.deleteLater)
+        self._worker_thread.finished.connect(self._clear_worker_state)
         self._worker_thread.start()
 
-    def _save_transcript(self) -> None:
-        if self._last_result is None:
-            QMessageBox.information(self, "Nothing to Save", "Record and transcribe audio first.")
+    def _copy_transcript_to_clipboard(self) -> None:
+        if not self._current_transcript_text:
             return
+        QApplication.clipboard().setText(self._current_transcript_text)
+        self._set_status("Copied to clipboard.")
 
-        path, _selected = QFileDialog.getSaveFileName(
-            self,
-            "Save Transcript",
-            str(Path.home() / "talk2text-transcript.txt"),
-            "Text Files (*.txt)",
-        )
-        if not path:
+    def _open_history_item(self, item: QListWidgetItem) -> None:
+        index = item.data(Qt.ItemDataRole.UserRole)
+        if index is None:
             return
+        entry = self._history_entries[int(index)]
+        self._last_result = entry.result
+        self._show_transcript(entry.display_text)
+        self._set_status(f"Loaded transcript from {entry.created_at}.")
+        self._show_main_page()
 
-        lines = [
-            "Talk2Text Transcript",
-            "",
-            f"Audio file: {self._last_result.audio_path}",
-            f"Duration: {self._last_result.duration_seconds:.1f}s",
-            f"Detected language: {self._last_result.detected_language or 'unknown'}",
-            "",
-            "Raw Transcript",
-            self._last_result.raw_text,
-            "",
-            "Processed Transcript",
-            self._last_result.cleaned_text,
-            "",
-            "Summary",
-            self._last_result.summary,
-            "",
-            "Action Items",
-        ]
-        lines.extend(self._last_result.action_items or [""])
-        lines.extend(["", "Notes"])
-        lines.extend(self._last_result.notes)
-
-        Path(path).write_text("\n".join(lines), encoding="utf-8")
-        self._set_status(f"Saved transcript to {path}")
+    def _clear_history(self) -> None:
+        self._history_entries.clear()
+        self.history_list.clear()
+        self._set_status("History cleared.")
 
     @Slot(object)
     def _handle_result(self, result: TranscriptionResult) -> None:
         self._last_result = result
-        self.raw_transcript.setPlainText(result.raw_text)
-        self.cleaned_transcript.setPlainText(result.cleaned_text)
-        self.summary_text.setPlainText(result.summary)
-        self.action_list.clear()
-        self.action_list.addItems(result.action_items)
-        self.notes_text.setPlainText("\n".join(result.notes))
+        self._show_transcript(result.cleaned_text or result.raw_text)
+        self._add_history_entry(result)
+        self._is_processing = False
         self._set_idle_state()
         self._set_status(
-            f"Done. {result.duration_seconds:.1f}s audio, language={result.detected_language or 'unknown'}."
+            f"Done in {result.duration_seconds:.1f}s, {result.detected_language or 'unknown'}."
         )
 
     @Slot(str)
     def _handle_error(self, message: str) -> None:
+        self._is_processing = False
         self._set_idle_state()
         self._set_status(f"Processing failed: {message}")
         QMessageBox.critical(self, "Processing Error", message)
 
+    @Slot(str)
+    def _handle_cancelled(self, message: str) -> None:
+        self._is_processing = False
+        self._set_idle_state()
+        self._set_status(message)
+        self.prompt_label.setText("Tap once to start")
+
+    def _add_history_entry(self, result: TranscriptionResult) -> None:
+        entry = HistoryEntry(
+            created_at=datetime.now().strftime("%H:%M"),
+            result=result,
+        )
+        self._history_entries.insert(0, entry)
+
+        item = QListWidgetItem()
+        snippet = entry.display_text.replace("\n", " ").strip()
+        if len(snippet) > 52:
+            snippet = f"{snippet[:49]}..."
+        item.setText(f"{entry.created_at}  {snippet or 'Empty transcript'}")
+        item.setToolTip(entry.display_text)
+        item.setData(Qt.ItemDataRole.UserRole, 0)
+        self.history_list.insertItem(0, item)
+
+        for index in range(self.history_list.count()):
+            existing_item = self.history_list.item(index)
+            existing_item.setData(Qt.ItemDataRole.UserRole, index)
+
+    def _show_transcript(self, text: str) -> None:
+        self._current_transcript_text = text.strip()
+        if self._current_transcript_text:
+            self.transcript_label.setText(self._current_transcript_text)
+        else:
+            self.transcript_label.setText("No transcript yet.")
+        self.copy_button.setEnabled(bool(self._current_transcript_text))
+
+    def _show_placeholder_transcript(self, text: str) -> None:
+        self._current_transcript_text = ""
+        self.transcript_label.setText(text)
+        self.copy_button.setEnabled(False)
+
     def _set_idle_state(self) -> None:
-        self.start_button.setEnabled(True)
-        self.stop_button.setEnabled(False)
-        self.save_button.setEnabled(self._last_result is not None)
         self.elapsed_timer.stop()
         self._recording_started_at = None
         self.recording_clock.setText("00:00")
+        self.prompt_label.setText("Tap once to start")
+        self._set_record_button_mode("idle", "REC")
+        self._set_navigation_enabled(True)
 
     def _set_status(self, message: str) -> None:
-        self.status_label.setText(message)
+        self.main_status_label.setText(message)
+        self.config_status_label.setText(message)
+        self.history_status_label.setText(message)
+
+    def _set_record_button_mode(self, mode: str, text: str) -> None:
+        self.record_button.setProperty("mode", mode)
+        self.record_button.setText(text)
+        self.record_button.setEnabled(mode != "working")
+        self.record_button.style().unpolish(self.record_button)
+        self.record_button.style().polish(self.record_button)
+        self.record_button.update()
+
+    def _set_navigation_enabled(self, enabled: bool) -> None:
+        for button in self._nav_buttons:
+            button.setEnabled(enabled)
+        self.apply_button.setEnabled(enabled)
+        self.clear_history_button.setEnabled(enabled)
+
+    @Slot()
+    def _clear_worker_state(self) -> None:
+        self._worker = None
+        self._worker_thread = None
 
     def _update_recording_clock(self) -> None:
         if self._recording_started_at is None:

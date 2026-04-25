@@ -3,11 +3,13 @@ from __future__ import annotations
 from collections.abc import Callable
 import time
 
+from .errors import ProcessingCancelledError
 from .models import RecordedAudio, TranscriptionResult
 from .ollama_client import OllamaClient
 from .transcription import FasterWhisperTranscriber
 
 StatusCallback = Callable[[str], None]
+CancelCallback = Callable[[], bool]
 
 
 class Talk2TextPipeline:
@@ -23,17 +25,28 @@ class Talk2TextPipeline:
         ollama_model: str,
         language: str | None,
         status_callback: StatusCallback | None = None,
+        cancel_requested: CancelCallback | None = None,
     ) -> TranscriptionResult:
         def report(message: str) -> None:
             if status_callback is not None:
                 status_callback(message)
 
+        def raise_if_cancelled() -> None:
+            if cancel_requested is not None and cancel_requested():
+                raise ProcessingCancelledError()
+
         started_at = time.perf_counter()
+        raise_if_cancelled()
         self.transcriber.set_model_name(whisper_model)
         report(f"Transcribing with faster-whisper ({whisper_model})...")
         transcription_started_at = time.perf_counter()
-        transcription = self.transcriber.transcribe(recorded_audio.path, language=language)
+        transcription = self.transcriber.transcribe(
+            recorded_audio.path,
+            language=language,
+            cancel_requested=cancel_requested,
+        )
         transcription_elapsed = time.perf_counter() - transcription_started_at
+        raise_if_cancelled()
         if not transcription.raw_text:
             raise RuntimeError("Whisper returned an empty transcript.")
 
@@ -51,12 +64,15 @@ class Talk2TextPipeline:
                     raw_text=transcription.raw_text,
                     model_name=ollama_model,
                     language_hint=language or transcription.detected_language,
+                    cancel_requested=cancel_requested,
                 )
                 ollama_elapsed = time.perf_counter() - ollama_started_at
                 cleaned_text = cleanup.cleaned_text
                 summary = cleanup.summary
                 action_items = cleanup.action_items
                 notes.append(f"Ollama enhancement applied with {ollama_model} in {ollama_elapsed:.2f}s")
+            except ProcessingCancelledError:
+                raise
             except Exception as exc:
                 ollama_elapsed = time.perf_counter() - ollama_started_at
                 notes.append(f"Ollama enhancement failed after {ollama_elapsed:.2f}s")
