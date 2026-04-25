@@ -2,39 +2,25 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from multiprocessing import freeze_support
 import sys
-import threading
 import time
 
-from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtCore import QTimer, Qt, Slot
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
-    QComboBox,
-    QFrame,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QListWidget,
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
-    QPushButton,
-    QScrollArea,
-    QStackedWidget,
     QToolButton,
-    QVBoxLayout,
-    QWidget,
 )
 
 from .audio import MicrophoneRecorder, list_input_devices
 from .config import AppConfig
-from .errors import ProcessingCancelledError
-from .models import RecordedAudio, TranscriptionResult
+from .models import CleanupUpdate, LiveTranscriptionUpdate, RecordedAudio, TranscriptionResult
 from .ollama_client import OllamaClient
-from .pipeline import Talk2TextPipeline
-from .transcription import FasterWhisperTranscriber
+from .ui_layout import build_ui
+from .worker_client import ProcessWorkerClient
 
 WHISPER_MODELS = [
     "tiny",
@@ -48,7 +34,9 @@ WHISPER_MODELS = [
 
 LIVE_TRANSCRIPTION_INTERVAL_MS = 900
 LIVE_TRANSCRIPTION_MIN_DURATION_SECONDS = 0.6
-LIVE_TRANSCRIPTION_WINDOW_SECONDS = 8.0
+LIVE_TRANSCRIPTION_WINDOW_SECONDS = 5.0
+LIVE_VOICE_MEAN_ABS_THRESHOLD = 120
+LIVE_VOICE_PEAK_ABS_THRESHOLD = 800
 LIVE_LANGUAGE_LOCK_MIN_DURATION_SECONDS = 2.0
 LIVE_LANGUAGE_LOCK_MIN_WORDS = 3
 
@@ -63,122 +51,16 @@ class HistoryEntry:
         return self.result.cleaned_text or self.result.raw_text
 
 
-@dataclass(slots=True)
-class LiveTranscriptionUpdate:
-    session_id: int
-    text: str
-    detected_language: str | None
-    duration_seconds: float
-
-
-class PipelineWorker(QObject):
-    finished = Signal(object)
-    error = Signal(str)
-    cancelled = Signal(str)
-    progress = Signal(str)
-
-    def __init__(self, pipeline: Talk2TextPipeline) -> None:
-        super().__init__()
-        self.pipeline = pipeline
-        self._cancel_event = threading.Event()
-
-    @Slot()
-    def cancel_current(self) -> None:
-        self._cancel_event.set()
-
-    @Slot(object, str, bool, str, object)
-    def process_recording(
-        self,
-        recorded_audio: RecordedAudio,
-        whisper_model: str,
-        use_ollama: bool,
-        ollama_model: str,
-        language: str | None,
-    ) -> None:
-        self._cancel_event.clear()
-        try:
-            result = self.pipeline.process(
-                recorded_audio=recorded_audio,
-                whisper_model=whisper_model,
-                use_ollama=use_ollama,
-                ollama_model=ollama_model,
-                language=language,
-                status_callback=self.progress.emit,
-                cancel_requested=self._cancel_event.is_set,
-            )
-        except ProcessingCancelledError as exc:
-            self.cancelled.emit(str(exc))
-            return
-        except Exception as exc:
-            self.error.emit(str(exc))
-            return
-
-        self.finished.emit(result)
-
-
-class LiveTranscriptionWorker(QObject):
-    finished = Signal(object)
-    error = Signal(str)
-    cancelled = Signal()
-
-    def __init__(self, transcriber: FasterWhisperTranscriber) -> None:
-        super().__init__()
-        self.transcriber = transcriber
-        self._cancel_event = threading.Event()
-
-    @Slot()
-    def cancel_current(self) -> None:
-        self._cancel_event.set()
-
-    @Slot(object, str, object, int)
-    def process_snapshot(
-        self,
-        recorded_audio: RecordedAudio,
-        whisper_model: str,
-        language: str | None,
-        session_id: int,
-    ) -> None:
-        self._cancel_event.clear()
-        try:
-            self.transcriber.set_model_name(whisper_model)
-            transcription = self.transcriber.transcribe(
-                recorded_audio.path,
-                language=language,
-                cancel_requested=self._cancel_event.is_set,
-            )
-        except ProcessingCancelledError:
-            self.cancelled.emit()
-            return
-        except Exception as exc:
-            self.error.emit(str(exc))
-            return
-        finally:
-            _unlink_file(recorded_audio.path)
-
-        self.finished.emit(
-            LiveTranscriptionUpdate(
-                session_id=session_id,
-                text=transcription.raw_text,
-                detected_language=transcription.detected_language,
-                duration_seconds=recorded_audio.duration_seconds,
-            )
-        )
-
-
 class MainWindow(QMainWindow):
-    request_live_transcription = Signal(object, str, object, int)
-    cancel_live_transcription = Signal()
-    request_pipeline_processing = Signal(object, str, bool, str, object)
-    cancel_pipeline_processing = Signal()
-
     def __init__(self, config: AppConfig) -> None:
         super().__init__()
         self.config = config
-        self.recorder = MicrophoneRecorder(sample_rate=config.sample_rate)
-        self.transcriber = FasterWhisperTranscriber(config.whisper_model)
-        self.live_transcriber = FasterWhisperTranscriber(config.whisper_model)
+        self.recorder = MicrophoneRecorder(
+            sample_rate=config.sample_rate,
+            rolling_buffer_seconds=LIVE_TRANSCRIPTION_WINDOW_SECONDS,
+        )
         self.ollama_client = OllamaClient(config.ollama_base_url)
-        self.pipeline = Talk2TextPipeline(self.transcriber, self.ollama_client)
+        self._worker_client = ProcessWorkerClient(config.ollama_base_url, self)
 
         self._recording_started_at: float | None = None
         self._last_result: TranscriptionResult | None = None
@@ -188,7 +70,10 @@ class MainWindow(QMainWindow):
         self._live_session_id = 0
         self._live_request_in_flight = False
         self._pipeline_request_in_flight = False
+        self._cleanup_request_in_flight = False
         self._pending_final_audio: RecordedAudio | None = None
+        self._active_live_snapshot: RecordedAudio | None = None
+        self._active_pipeline_audio: RecordedAudio | None = None
         self._session_language_hint: str | None = None
         self._nav_buttons: list[QToolButton] = []
 
@@ -198,457 +83,37 @@ class MainWindow(QMainWindow):
         self.live_timer.setInterval(LIVE_TRANSCRIPTION_INTERVAL_MS)
         self.live_timer.timeout.connect(self._queue_live_transcription)
 
-        self._live_thread = QThread(self)
-        self._live_worker = LiveTranscriptionWorker(self.live_transcriber)
-        self._live_worker.moveToThread(self._live_thread)
-        self.request_live_transcription.connect(self._live_worker.process_snapshot)
-        self.cancel_live_transcription.connect(self._live_worker.cancel_current)
-        self._live_worker.finished.connect(self._handle_live_update)
-        self._live_worker.error.connect(self._handle_live_error)
-        self._live_worker.cancelled.connect(self._handle_live_cancelled)
-        self._live_thread.finished.connect(self._live_worker.deleteLater)
-        self._live_thread.start()
-
-        self._pipeline_thread = QThread(self)
-        self._pipeline_worker = PipelineWorker(self.pipeline)
-        self._pipeline_worker.moveToThread(self._pipeline_thread)
-        self.request_pipeline_processing.connect(self._pipeline_worker.process_recording)
-        self.cancel_pipeline_processing.connect(self._pipeline_worker.cancel_current)
-        self._pipeline_worker.progress.connect(self._set_status)
-        self._pipeline_worker.finished.connect(self._handle_result)
-        self._pipeline_worker.error.connect(self._handle_error)
-        self._pipeline_worker.cancelled.connect(self._handle_cancelled)
-        self._pipeline_thread.finished.connect(self._pipeline_worker.deleteLater)
-        self._pipeline_thread.start()
+        self._worker_client.progress.connect(self._set_status)
+        self._worker_client.live_finished.connect(self._handle_live_update)
+        self._worker_client.live_error.connect(self._handle_live_error)
+        self._worker_client.live_cancelled.connect(self._handle_live_cancelled)
+        self._worker_client.pipeline_finished.connect(self._handle_result)
+        self._worker_client.pipeline_error.connect(self._handle_error)
+        self._worker_client.pipeline_cancelled.connect(self._handle_cancelled)
+        self._worker_client.cleanup_finished.connect(self._handle_cleanup_result)
+        self._worker_client.cleanup_error.connect(self._handle_cleanup_error)
+        self._worker_client.cleanup_cancelled.connect(self._handle_cleanup_cancelled)
 
         self.setWindowTitle("Talk2Text")
         self.setFixedSize(300, 400)
-        self._build_ui()
+        build_ui(self, self.config, WHISPER_MODELS)
         self._load_input_devices()
         self._load_ollama_models()
         self._show_placeholder_transcript("Tap the red button to record.")
         self._set_status("Ready")
         self._set_idle_state()
 
-    def _build_ui(self) -> None:
-        self.setStyleSheet(
-            """
-            QMainWindow {
-                background: #f5f1ea;
-            }
-            QWidget {
-                color: #30261d;
-                font-size: 11px;
-            }
-            QFrame#transcriptCard, QFrame#panelCard {
-                background: #fffdf8;
-                border: 1px solid #e5ddd1;
-                border-radius: 16px;
-            }
-            QLabel#statusPill {
-                background: #ece4d8;
-                border-radius: 10px;
-                color: #5f4f41;
-                padding: 4px 8px;
-                font-size: 10px;
-            }
-            QPushButton#recordButton {
-                background: #d84c4c;
-                border: 4px solid #f7d7d7;
-                border-radius: 42px;
-                color: white;
-                font-size: 13px;
-                font-weight: 700;
-            }
-            QPushButton#recordButton[mode="recording"] {
-                background: #8f2424;
-                border-color: #f3b9b9;
-            }
-            QPushButton#recordButton[mode="working"] {
-                background: #d9a6a6;
-                border-color: #f3d8d8;
-                color: #fff8f8;
-            }
-            QPushButton#recordButton[mode="cancel"] {
-                background: #db8c4a;
-                border-color: #f0d1b6;
-                color: #fff9f3;
-            }
-            QPushButton#copyButton, QPushButton#applyButton, QPushButton#clearHistoryButton {
-                background: #d8efe5;
-                border: none;
-                border-radius: 12px;
-                color: #245843;
-                font-size: 10px;
-                font-weight: 600;
-                padding: 6px 10px;
-            }
-            QPushButton#clearHistoryButton {
-                background: #f2e6da;
-                color: #7a5233;
-            }
-            QPushButton#refreshButton {
-                background: #efe7dc;
-                border: none;
-                border-radius: 10px;
-                color: #5f4f41;
-                font-size: 10px;
-                padding: 5px 8px;
-            }
-            QComboBox, QLineEdit {
-                background: white;
-                border: 1px solid #ded4c8;
-                border-radius: 10px;
-                padding: 6px 8px;
-                min-height: 16px;
-            }
-            QCheckBox {
-                spacing: 8px;
-            }
-            QListWidget {
-                background: white;
-                border: 1px solid #ded4c8;
-                border-radius: 12px;
-                padding: 4px;
-            }
-            QListWidget::item {
-                border-radius: 10px;
-                padding: 6px;
-                margin: 2px 0px;
-            }
-            QListWidget::item:selected {
-                background: #ece4d8;
-                color: #30261d;
-            }
-            QToolButton {
-                background: transparent;
-                border: none;
-                border-radius: 12px;
-                padding: 4px;
-                min-width: 24px;
-                min-height: 24px;
-            }
-            QToolButton:hover {
-                background: #ece4d8;
-            }
-            """
-        )
-
-        root = QWidget(self)
-        self.setCentralWidget(root)
-
-        outer = QVBoxLayout(root)
-        outer.setContentsMargins(0, 0, 0, 0)
-
-        self.stack = QStackedWidget()
-        outer.addWidget(self.stack)
-
-        self.main_page = self._build_main_page()
-        self.config_page = self._build_config_page()
-        self.history_page = self._build_history_page()
-
-        self.stack.addWidget(self.main_page)
-        self.stack.addWidget(self.config_page)
-        self.stack.addWidget(self.history_page)
-        self.stack.setCurrentWidget(self.main_page)
-
-    def _build_main_page(self) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
-
-        header = QHBoxLayout()
-        header.setSpacing(4)
-        self.config_button = self._make_icon_button(
-            theme_name="settings-configure",
-            fallback_text="",
-            tooltip="Settings",
-            handler=self._show_config_page,
-            fallback_icon=self._gear_icon(),
-        )
-        self.history_button = self._make_icon_button(
-            theme_name="document-open-recent",
-            fallback_text="H",
-            tooltip="History",
-            handler=self._show_history_page,
-        )
-        title = QLabel("Talk2Text")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setStyleSheet("font-size: 12px; font-weight: 700;")
-        header.addWidget(self.config_button)
-        header.addWidget(title, 1)
-        header.addWidget(self.history_button)
-        layout.addLayout(header)
-
-        self.main_status_label = QLabel()
-        self.main_status_label.setObjectName("statusPill")
-        self.main_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.main_status_label)
-
-        self.recording_clock = QLabel("00:00")
-        self.recording_clock.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.recording_clock.setStyleSheet("font-size: 10px; color: #8b7560;")
-        layout.addWidget(self.recording_clock)
-
-        layout.addStretch(1)
-
-        self.record_button = QPushButton("REC")
-        self.record_button.setObjectName("recordButton")
-        self.record_button.setFixedSize(84, 84)
-        self.record_button.clicked.connect(self._toggle_recording)
-        layout.addWidget(self.record_button, 0, Qt.AlignmentFlag.AlignHCenter)
-
-        self.prompt_label = QLabel("Tap once to start")
-        self.prompt_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.prompt_label.setStyleSheet("font-size: 10px; color: #6a5848;")
-        layout.addWidget(self.prompt_label)
-
-        transcript_card = QFrame()
-        transcript_card.setObjectName("transcriptCard")
-        transcript_layout = QVBoxLayout(transcript_card)
-        transcript_layout.setContentsMargins(10, 10, 10, 10)
-        transcript_layout.setSpacing(6)
-
-        transcript_title = QLabel("Transcript")
-        transcript_title.setStyleSheet("font-size: 10px; font-weight: 700; color: #6a5848;")
-        transcript_layout.addWidget(transcript_title)
-
-        transcript_scroll = QScrollArea()
-        transcript_scroll.setWidgetResizable(True)
-        transcript_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        transcript_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        transcript_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-
-        transcript_content = QWidget()
-        transcript_content_layout = QVBoxLayout(transcript_content)
-        transcript_content_layout.setContentsMargins(0, 0, 0, 0)
-        self.transcript_label = QLabel()
-        self.transcript_label.setWordWrap(True)
-        self.transcript_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.transcript_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        self.transcript_label.setStyleSheet("font-size: 11px;")
-        transcript_content_layout.addWidget(self.transcript_label)
-        transcript_content_layout.addStretch(1)
-        transcript_scroll.setWidget(transcript_content)
-        transcript_layout.addWidget(transcript_scroll, 1)
-
-        layout.addWidget(transcript_card, 1)
-
-        copy_row = QHBoxLayout()
-        copy_row.addStretch(1)
-        self.copy_button = QPushButton("Copy")
-        self.copy_button.setObjectName("copyButton")
-        copy_icon = QIcon.fromTheme("edit-copy")
-        if not copy_icon.isNull():
-            self.copy_button.setIcon(copy_icon)
-        self.copy_button.clicked.connect(self._copy_transcript_to_clipboard)
-        copy_row.addWidget(self.copy_button)
-        layout.addLayout(copy_row)
-
-        return page
-
-    def _build_config_page(self) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
-
-        header = QHBoxLayout()
-        back_button = self._make_icon_button(
-            theme_name="go-previous",
-            fallback_text="<",
-            tooltip="Back",
-            handler=self._show_main_page,
-        )
-        header.addWidget(back_button)
-        config_title = QLabel("Settings")
-        config_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        config_title.setStyleSheet("font-size: 12px; font-weight: 700;")
-        header.addWidget(config_title, 1)
-        header.addSpacing(24)
-        layout.addLayout(header)
-
-        self.config_status_label = QLabel()
-        self.config_status_label.setObjectName("statusPill")
-        self.config_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.config_status_label)
-
-        card = QFrame()
-        card.setObjectName("panelCard")
-        card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(10, 10, 10, 10)
-        card_layout.setSpacing(8)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-
-        content = QWidget()
-        content_layout = QVBoxLayout(content)
-        content_layout.setContentsMargins(0, 0, 0, 0)
-        content_layout.setSpacing(8)
-
-        self.device_combo = QComboBox()
-        self.refresh_devices_button = QPushButton("Refresh Devices")
-        self.refresh_devices_button.setObjectName("refreshButton")
-        self.refresh_devices_button.clicked.connect(self._load_input_devices)
-        self._add_config_field(content_layout, "Input Device", self.device_combo, self.refresh_devices_button)
-
-        self.whisper_model_combo = QComboBox()
-        self.whisper_model_combo.setEditable(True)
-        self.whisper_model_combo.addItems(WHISPER_MODELS)
-        if self.config.whisper_model not in WHISPER_MODELS:
-            self.whisper_model_combo.addItem(self.config.whisper_model)
-        self.whisper_model_combo.setCurrentText(self.config.whisper_model)
-        self._add_config_field(content_layout, "Whisper Model", self.whisper_model_combo)
-
-        self.language_input = QLineEdit(self.config.language or "")
-        self.language_input.setPlaceholderText("Auto-detect")
-        self._add_config_field(content_layout, "Language Hint", self.language_input)
-
-        self.ollama_model_combo = QComboBox()
-        self.ollama_model_combo.setEditable(True)
-        self.ollama_model_combo.setCurrentText(self.config.ollama_model)
-        self.refresh_ollama_button = QPushButton("Refresh Models")
-        self.refresh_ollama_button.setObjectName("refreshButton")
-        self.refresh_ollama_button.clicked.connect(self._load_ollama_models)
-        self._add_config_field(content_layout, "Ollama Model", self.ollama_model_combo, self.refresh_ollama_button)
-
-        self.enhance_checkbox = QCheckBox("Enhance transcript with Ollama")
-        self.enhance_checkbox.setChecked(self.config.enhance_with_ollama)
-        content_layout.addWidget(self.enhance_checkbox)
-
-        self.live_transcription_checkbox = QCheckBox("Enable live transcription")
-        self.live_transcription_checkbox.setChecked(self.config.live_transcription)
-        content_layout.addWidget(self.live_transcription_checkbox)
-
-        content_layout.addStretch(1)
-        scroll.setWidget(content)
-        card_layout.addWidget(scroll)
-        layout.addWidget(card, 1)
-
-        self.apply_button = QPushButton("Apply")
-        self.apply_button.setObjectName("applyButton")
-        self.apply_button.clicked.connect(self._apply_settings)
-        layout.addWidget(self.apply_button)
-
-        return page
-
-    def _build_history_page(self) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
-
-        header = QHBoxLayout()
-        back_button = self._make_icon_button(
-            theme_name="go-previous",
-            fallback_text="<",
-            tooltip="Back",
-            handler=self._show_main_page,
-        )
-        header.addWidget(back_button)
-        history_title = QLabel("History")
-        history_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        history_title.setStyleSheet("font-size: 12px; font-weight: 700;")
-        header.addWidget(history_title, 1)
-        self.clear_history_button = QPushButton("Clear")
-        self.clear_history_button.setObjectName("clearHistoryButton")
-        self.clear_history_button.clicked.connect(self._clear_history)
-        header.addWidget(self.clear_history_button)
-        layout.addLayout(header)
-
-        self.history_status_label = QLabel("Tap an item to load it on the main page.")
-        self.history_status_label.setObjectName("statusPill")
-        self.history_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.history_status_label)
-
-        self.history_list = QListWidget()
-        self.history_list.itemClicked.connect(self._open_history_item)
-        self.history_list.itemActivated.connect(self._open_history_item)
-        layout.addWidget(self.history_list, 1)
-
-        return page
-
-    def _add_config_field(
-        self,
-        parent_layout: QVBoxLayout,
-        label_text: str,
-        widget: QWidget,
-        extra_button: QPushButton | None = None,
-    ) -> None:
-        label = QLabel(label_text)
-        label.setStyleSheet("font-size: 10px; font-weight: 700; color: #6a5848;")
-        parent_layout.addWidget(label)
-        parent_layout.addWidget(widget)
-        if extra_button is not None:
-            parent_layout.addWidget(extra_button, 0, Qt.AlignmentFlag.AlignRight)
-
-    def _make_icon_button(
-        self,
-        theme_name: str,
-        fallback_text: str,
-        tooltip: str,
-        handler,
-        fallback_icon: QIcon | None = None,
-    ) -> QToolButton:
-        button = QToolButton()
-        button.setToolTip(tooltip)
-        icon = QIcon.fromTheme(theme_name)
-        if not icon.isNull():
-            button.setIcon(icon)
-        elif fallback_icon is not None:
-            button.setIcon(fallback_icon)
-        else:
-            button.setText(fallback_text)
-        button.clicked.connect(handler)
-        self._nav_buttons.append(button)
-        return button
-
-    def _gear_icon(self) -> QIcon:
-        size = 18
-        pixmap = QPixmap(size, size)
-        pixmap.fill(Qt.GlobalColor.transparent)
-
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.translate(size / 2, size / 2)
-
-        tooth_pen = QPen(QColor("#6a5848"))
-        tooth_pen.setWidthF(1.6)
-        tooth_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        painter.setPen(tooth_pen)
-
-        for angle in range(0, 360, 45):
-            painter.save()
-            painter.rotate(angle)
-            painter.drawLine(0, -7.5, 0, -5.0)
-            painter.restore()
-
-        painter.setPen(QPen(QColor("#6a5848"), 1.6))
-        painter.setBrush(QColor("#ece4d8"))
-        painter.drawEllipse(-4.8, -4.8, 9.6, 9.6)
-        painter.setBrush(QColor("#f5f1ea"))
-        painter.drawEllipse(-1.7, -1.7, 3.4, 3.4)
-        painter.end()
-
-        return QIcon(pixmap)
-
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self.live_timer.stop()
-        self.cancel_live_transcription.emit()
-        self.cancel_pipeline_processing.emit()
         if self.recorder.is_recording:
             try:
-                self.recorder.stop()
+                _discard_recorded_audio(self.recorder.stop())
             except Exception:
                 pass
-        self._live_thread.quit()
-        self._live_thread.wait(2000)
-        self._pipeline_thread.quit()
-        self._pipeline_thread.wait(2000)
+        self._worker_client.shutdown()
+        self._release_active_live_snapshot()
+        self._discard_pending_final_audio()
+        self._release_active_pipeline_audio()
         super().closeEvent(event)
 
     def _show_main_page(self) -> None:
@@ -665,6 +130,11 @@ class MainWindow(QMainWindow):
 
     def _active_language_hint(self) -> str | None:
         return self._session_language_hint or self._selected_language()
+
+    def _cleanup_language_hint(self) -> str | None:
+        if self._last_result is not None and self._last_result.detected_language:
+            return self._last_result.detected_language
+        return self._selected_language()
 
     def _live_transcription_enabled(self) -> bool:
         return self.live_transcription_checkbox.isChecked()
@@ -736,6 +206,7 @@ class MainWindow(QMainWindow):
         self.config.enhance_with_ollama = self.enhance_checkbox.isChecked()
         self.config.live_transcription = self._live_transcription_enabled()
         self._set_status("Settings updated.")
+        self._update_action_buttons()
         self._show_main_page()
 
     def _toggle_recording(self) -> None:
@@ -748,19 +219,33 @@ class MainWindow(QMainWindow):
             self._start_recording()
 
     def _cancel_processing(self) -> None:
-        if self._pipeline_request_in_flight:
-            self.cancel_pipeline_processing.emit()
+        if self._cleanup_request_in_flight:
+            self._worker_client.cancel_current()
+        elif self._pipeline_request_in_flight:
+            self._worker_client.cancel_current()
         elif self._pending_final_audio is not None:
-            self._pending_final_audio = None
+            self._discard_pending_final_audio()
             if self._live_request_in_flight:
-                self.cancel_live_transcription.emit()
+                self._worker_client.cancel_current()
             else:
                 self._handle_cancelled("Processing cancelled.")
         else:
             return
-        self.prompt_label.setText("Cancelling...")
-        self._set_status("Cancelling transcription...")
-        self._set_record_button_mode("working", "...")
+
+    def _discard_pending_final_audio(self) -> None:
+        if self._pending_final_audio is not None:
+            _discard_recorded_audio(self._pending_final_audio)
+            self._pending_final_audio = None
+
+    def _release_active_live_snapshot(self) -> None:
+        if self._active_live_snapshot is not None:
+            _unlink_file(self._active_live_snapshot.path)
+            self._active_live_snapshot = None
+
+    def _release_active_pipeline_audio(self) -> None:
+        if self._active_pipeline_audio is not None:
+            _discard_recorded_audio(self._active_pipeline_audio)
+            self._active_pipeline_audio = None
 
     def _start_recording(self) -> None:
         try:
@@ -771,6 +256,7 @@ class MainWindow(QMainWindow):
 
         self._live_session_id += 1
         self._pending_final_audio = None
+        self._active_live_snapshot = None
         self._session_language_hint = self._selected_language()
         self._last_result = None
         self._recording_started_at = time.monotonic()
@@ -806,7 +292,7 @@ class MainWindow(QMainWindow):
             self.prompt_label.setText("Finalizing...")
             self._set_status("Stopping recording and finalizing transcript...")
             if self._live_request_in_flight:
-                self.cancel_live_transcription.emit()
+                self._worker_client.cancel_current()
                 return
             self._start_pending_final_processing()
             return
@@ -825,6 +311,12 @@ class MainWindow(QMainWindow):
             return
 
         try:
+            if not self.recorder.has_voice_activity(
+                max_duration_seconds=LIVE_TRANSCRIPTION_WINDOW_SECONDS,
+                min_mean_abs=LIVE_VOICE_MEAN_ABS_THRESHOLD,
+                min_peak_abs=LIVE_VOICE_PEAK_ABS_THRESHOLD,
+            ):
+                return
             snapshot = self.recorder.snapshot(max_duration_seconds=LIVE_TRANSCRIPTION_WINDOW_SECONDS)
         except RuntimeError as exc:
             if "No microphone audio" in str(exc):
@@ -840,17 +332,28 @@ class MainWindow(QMainWindow):
             return
 
         self._live_request_in_flight = True
-        self.request_live_transcription.emit(
-            snapshot,
-            self._selected_whisper_model(),
-            self._active_language_hint(),
-            self._live_session_id,
-        )
+        self._active_live_snapshot = snapshot
+        try:
+            self._worker_client.request_live(
+                snapshot,
+                self._selected_whisper_model(),
+                self._active_language_hint(),
+                self._live_session_id,
+            )
+        except Exception as exc:
+            self._live_request_in_flight = False
+            self._release_active_live_snapshot()
+            self._set_status(f"Live transcription failed: {exc}")
 
     def _start_pending_final_processing(self) -> None:
         if self._pending_final_audio is None:
             return
-        if self.recorder.is_recording or self._live_request_in_flight or self._pipeline_request_in_flight:
+        if (
+            self.recorder.is_recording
+            or self._live_request_in_flight
+            or self._pipeline_request_in_flight
+            or self._cleanup_request_in_flight
+        ):
             return
 
         recorded_audio = self._pending_final_audio
@@ -861,17 +364,27 @@ class MainWindow(QMainWindow):
 
     def _run_pipeline(self, recorded_audio: RecordedAudio) -> None:
         self._pipeline_request_in_flight = True
-        self.request_pipeline_processing.emit(
-            recorded_audio,
-            self._selected_whisper_model(),
-            self.enhance_checkbox.isChecked(),
-            self._selected_ollama_model(),
-            self._active_language_hint(),
-        )
+        self._active_pipeline_audio = recorded_audio
+        try:
+            self._worker_client.request_pipeline(
+                recorded_audio,
+                self._selected_whisper_model(),
+                False,
+                self._selected_ollama_model(),
+                self._active_language_hint(),
+            )
+        except Exception as exc:
+            self._pipeline_request_in_flight = False
+            self._release_active_pipeline_audio()
+            self._is_processing = False
+            self._set_idle_state()
+            self._set_status(f"Processing failed: {exc}")
+            QMessageBox.critical(self, "Processing Error", str(exc))
 
     @Slot(object)
     def _handle_live_update(self, update: LiveTranscriptionUpdate) -> None:
         self._live_request_in_flight = False
+        self._release_active_live_snapshot()
         if update.session_id != self._live_session_id or not self.recorder.is_recording:
             self._maybe_continue_after_live_worker()
             return
@@ -892,6 +405,7 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _handle_live_error(self, message: str) -> None:
         self._live_request_in_flight = False
+        self._release_active_live_snapshot()
         if self.recorder.is_recording:
             self._set_status(f"Live transcription skipped: {message}")
         self._maybe_continue_after_live_worker()
@@ -899,7 +413,43 @@ class MainWindow(QMainWindow):
     @Slot()
     def _handle_live_cancelled(self) -> None:
         self._live_request_in_flight = False
+        self._release_active_live_snapshot()
         self._maybe_continue_after_live_worker()
+
+    def _polish_transcript(self) -> None:
+        if self._last_result is None:
+            self._set_status("No transcript available to polish.")
+            return
+        if not self.enhance_checkbox.isChecked():
+            self._set_status("Manual Ollama polish is disabled in settings.")
+            return
+        if self.recorder.is_recording or self._is_processing:
+            return
+
+        source_text = self._last_result.raw_text.strip() or self._current_transcript_text
+        if not source_text:
+            self._set_status("No transcript available to polish.")
+            return
+
+        self._cleanup_request_in_flight = True
+        self._is_processing = True
+        self.prompt_label.setText("Polishing...")
+        self._set_status(f"Polishing transcript with Ollama ({self._selected_ollama_model()})...")
+        self._set_record_button_mode("cancel", "ABORT")
+        self._set_navigation_enabled(False)
+        self._update_action_buttons()
+        try:
+            self._worker_client.request_cleanup(
+                source_text,
+                self._selected_ollama_model(),
+                self._cleanup_language_hint(),
+            )
+        except Exception as exc:
+            self._cleanup_request_in_flight = False
+            self._is_processing = False
+            self._set_idle_state()
+            self._set_status(f"Ollama polish failed: {exc}")
+            QMessageBox.critical(self, "Ollama Error", str(exc))
 
     def _copy_transcript_to_clipboard(self) -> None:
         if not self._current_transcript_text:
@@ -925,6 +475,8 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _handle_result(self, result: TranscriptionResult) -> None:
         self._pipeline_request_in_flight = False
+        self._active_pipeline_audio = None
+        self._discard_result_audio(result)
         self._last_result = result
         self._show_transcript(result.cleaned_text or result.raw_text)
         self._add_history_entry(result)
@@ -934,17 +486,52 @@ class MainWindow(QMainWindow):
             f"Done in {result.duration_seconds:.1f}s, {result.detected_language or 'unknown'}."
         )
 
+    @Slot(object)
+    def _handle_cleanup_result(self, update: CleanupUpdate) -> None:
+        self._cleanup_request_in_flight = False
+        if self._last_result is not None:
+            self._last_result.cleaned_text = update.cleanup.cleaned_text
+            self._last_result.summary = update.cleanup.summary
+            self._last_result.action_items = update.cleanup.action_items
+            self._last_result.notes.append(
+                f"Manual Ollama polish with {update.model_name} in {update.elapsed_seconds:.2f}s"
+            )
+
+        self._show_transcript(update.cleanup.cleaned_text)
+        self._sync_history_list()
+        self._is_processing = False
+        self._set_idle_state()
+        self._set_status(f"Polished with {update.model_name} in {update.elapsed_seconds:.1f}s.")
+
     @Slot(str)
     def _handle_error(self, message: str) -> None:
         self._pipeline_request_in_flight = False
+        self._release_active_pipeline_audio()
         self._is_processing = False
         self._set_idle_state()
         self._set_status(f"Processing failed: {message}")
         QMessageBox.critical(self, "Processing Error", message)
 
     @Slot(str)
+    def _handle_cleanup_error(self, message: str) -> None:
+        self._cleanup_request_in_flight = False
+        self._is_processing = False
+        self._set_idle_state()
+        self._set_status(f"Ollama polish failed: {message}")
+        QMessageBox.critical(self, "Ollama Error", message)
+
+    @Slot(str)
     def _handle_cancelled(self, message: str) -> None:
         self._pipeline_request_in_flight = False
+        self._release_active_pipeline_audio()
+        self._is_processing = False
+        self._set_idle_state()
+        self._set_status(message)
+        self.prompt_label.setText("Tap once to start")
+
+    @Slot(str)
+    def _handle_cleanup_cancelled(self, message: str) -> None:
+        self._cleanup_request_in_flight = False
         self._is_processing = False
         self._set_idle_state()
         self._set_status(message)
@@ -956,19 +543,19 @@ class MainWindow(QMainWindow):
             result=result,
         )
         self._history_entries.insert(0, entry)
+        self._sync_history_list()
 
-        item = QListWidgetItem()
-        snippet = entry.display_text.replace("\n", " ").strip()
-        if len(snippet) > 52:
-            snippet = f"{snippet[:49]}..."
-        item.setText(f"{entry.created_at}  {snippet or 'Empty transcript'}")
-        item.setToolTip(entry.display_text)
-        item.setData(Qt.ItemDataRole.UserRole, 0)
-        self.history_list.insertItem(0, item)
-
-        for index in range(self.history_list.count()):
-            existing_item = self.history_list.item(index)
-            existing_item.setData(Qt.ItemDataRole.UserRole, index)
+    def _sync_history_list(self) -> None:
+        self.history_list.clear()
+        for index, entry in enumerate(self._history_entries):
+            item = QListWidgetItem()
+            snippet = entry.display_text.replace("\n", " ").strip()
+            if len(snippet) > 52:
+                snippet = f"{snippet[:49]}..."
+            item.setText(f"{entry.created_at}  {snippet or 'Empty transcript'}")
+            item.setToolTip(entry.display_text)
+            item.setData(Qt.ItemDataRole.UserRole, index)
+            self.history_list.addItem(item)
 
     def _show_transcript(self, text: str) -> None:
         self._current_transcript_text = text.strip()
@@ -976,12 +563,24 @@ class MainWindow(QMainWindow):
             self.transcript_label.setText(self._current_transcript_text)
         else:
             self.transcript_label.setText("No transcript yet.")
-        self.copy_button.setEnabled(bool(self._current_transcript_text))
+        self._update_action_buttons()
 
     def _show_placeholder_transcript(self, text: str) -> None:
         self._current_transcript_text = ""
         self.transcript_label.setText(text)
-        self.copy_button.setEnabled(False)
+        self._update_action_buttons()
+
+    def _update_action_buttons(self, _checked: bool | None = None) -> None:
+        has_text = bool(self._current_transcript_text)
+        busy = (
+            self.recorder.is_recording
+            or self._is_processing
+            or self._live_request_in_flight
+            or self._pipeline_request_in_flight
+            or self._cleanup_request_in_flight
+        )
+        self.copy_button.setEnabled(has_text)
+        self.polish_button.setEnabled(has_text and self.enhance_checkbox.isChecked() and not busy)
 
     def _maybe_lock_session_language(self, update: LiveTranscriptionUpdate) -> bool:
         if self._session_language_hint is not None:
@@ -1006,6 +605,7 @@ class MainWindow(QMainWindow):
         self.prompt_label.setText("Tap once to start")
         self._set_record_button_mode("idle", "REC")
         self._set_navigation_enabled(True)
+        self._update_action_buttons()
 
     def _set_status(self, message: str) -> None:
         self.main_status_label.setText(message)
@@ -1026,6 +626,12 @@ class MainWindow(QMainWindow):
         self.apply_button.setEnabled(enabled)
         self.clear_history_button.setEnabled(enabled)
 
+    def _discard_result_audio(self, result: TranscriptionResult) -> None:
+        if result.audio_path is None:
+            return
+        _unlink_file(result.audio_path)
+        result.audio_path = None
+
     @Slot()
     def _maybe_continue_after_live_worker(self) -> None:
         if (
@@ -1033,6 +639,7 @@ class MainWindow(QMainWindow):
             and not self.recorder.is_recording
             and not self._live_request_in_flight
             and not self._pipeline_request_in_flight
+            and not self._cleanup_request_in_flight
         ):
             self._start_pending_final_processing()
             return
@@ -1042,6 +649,7 @@ class MainWindow(QMainWindow):
             and not self.recorder.is_recording
             and not self._live_request_in_flight
             and not self._pipeline_request_in_flight
+            and not self._cleanup_request_in_flight
         ):
             self._handle_cancelled("Processing cancelled.")
 
@@ -1056,10 +664,15 @@ class MainWindow(QMainWindow):
 
 
 def main() -> int:
+    freeze_support()
     app = QApplication(sys.argv)
     window = MainWindow(AppConfig.from_env())
     window.show()
     return app.exec()
+
+
+def _discard_recorded_audio(recorded_audio: RecordedAudio) -> None:
+    _unlink_file(recorded_audio.path)
 
 
 def _unlink_file(path) -> None:

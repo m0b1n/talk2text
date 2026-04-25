@@ -33,6 +33,21 @@ class TranscriptionOutput:
 
 
 @dataclass(slots=True)
+class LiveTranscriptionUpdate:
+    session_id: int
+    text: str
+    detected_language: str | None
+    duration_seconds: float
+
+
+@dataclass(slots=True)
+class CleanupUpdate:
+    cleanup: TranscriptCleanup
+    model_name: str
+    elapsed_seconds: float
+
+
+@dataclass(slots=True)
 class TranscriptionResult:
     raw_text: str
     cleaned_text: str
@@ -40,5 +55,5 @@ class TranscriptionResult:
     action_items: list[str]
     detected_language: str | None
     notes: list[str]
-    audio_path: Path
+    audio_path: Path | None
     duration_seconds: float

@@ -12,15 +12,24 @@ from .models import InputDevice, RecordedAudio
 
 
 class MicrophoneRecorder:
-    def __init__(self, sample_rate: int = 16000, channels: int = 1) -> None:
+    def __init__(
+        self,
+        sample_rate: int = 16000,
+        channels: int = 1,
+        rolling_buffer_seconds: float = 6.0,
+    ) -> None:
         self.sample_rate = sample_rate
         self.channels = channels
+        self.rolling_buffer_seconds = rolling_buffer_seconds
         self._buffer = bytearray()
         self._buffer_lock = threading.Lock()
         self._audio_source: QAudioSource | None = None
         self._io_device: QIODevice | None = None
         self._audio_format: QAudioFormat | None = None
         self._device_id: str | None = None
+        self._session_path: Path | None = None
+        self._wav_file: wave.Wave_write | None = None
+        self._captured_bytes = 0
 
     @property
     def is_recording(self) -> bool:
@@ -41,8 +50,16 @@ class MicrophoneRecorder:
         if io_device is None:
             raise RuntimeError("Qt failed to start microphone capture.")
 
+        try:
+            session_path, wav_file = _open_recording_file(audio_format)
+        except Exception:
+            audio_source.stop()
+            raise
         with self._buffer_lock:
             self._buffer.clear()
+            self._captured_bytes = 0
+            self._session_path = session_path
+            self._wav_file = wav_file
         self._device_id = device_id
         self._audio_format = audio_format
         self._audio_source = audio_source
@@ -62,6 +79,30 @@ class MicrophoneRecorder:
             )
 
         return _recorded_audio_from_payload(payload, self._audio_format)
+
+    def has_voice_activity(
+        self,
+        max_duration_seconds: float | None = None,
+        min_mean_abs: int = 120,
+        min_peak_abs: int = 800,
+    ) -> bool:
+        if self._audio_source is None or self._io_device is None or self._audio_format is None:
+            raise RuntimeError("Recording has not started.")
+
+        self._pull_audio()
+        with self._buffer_lock:
+            payload = _select_snapshot_payload(
+                payload=bytes(self._buffer),
+                audio_format=self._audio_format,
+                max_duration_seconds=max_duration_seconds,
+            )
+
+        return _has_voice_activity(
+            payload=payload,
+            audio_format=self._audio_format,
+            min_mean_abs=min_mean_abs,
+            min_peak_abs=min_peak_abs,
+        )
 
     def stop(self) -> RecordedAudio:
         if self._audio_source is None or self._io_device is None or self._audio_format is None:
@@ -85,10 +126,28 @@ class MicrophoneRecorder:
         self._pull_audio()
 
         with self._buffer_lock:
-            payload = bytes(self._buffer)
+            session_path = self._session_path
+            wav_file = self._wav_file
+            captured_bytes = self._captured_bytes
             self._buffer.clear()
+            self._session_path = None
+            self._wav_file = None
+            self._captured_bytes = 0
 
-        return _recorded_audio_from_payload(payload, audio_format)
+        if wav_file is not None:
+            wav_file.close()
+        if session_path is None:
+            raise RuntimeError("Recording output path was not initialized.")
+
+        if captured_bytes <= 0:
+            _unlink_file(session_path)
+            raise RuntimeError("No microphone audio was captured.")
+
+        return _recorded_audio_from_file(
+            path=session_path,
+            audio_format=audio_format,
+            captured_bytes=captured_bytes,
+        )
 
     def _pull_audio(self) -> None:
         if self._io_device is None:
@@ -96,8 +155,18 @@ class MicrophoneRecorder:
 
         chunk = self._io_device.readAll()
         if chunk:
+            payload = bytes(chunk)
             with self._buffer_lock:
-                self._buffer.extend(bytes(chunk))
+                wav_file = self._wav_file
+                if wav_file is not None:
+                    wav_file.writeframesraw(payload)
+                self._captured_bytes += len(payload)
+                self._buffer.extend(payload)
+                _trim_live_buffer(
+                    buffer=self._buffer,
+                    audio_format=self._audio_format,
+                    max_duration_seconds=self.rolling_buffer_seconds,
+                )
 
 
 def list_input_devices() -> list[InputDevice]:
@@ -224,6 +293,36 @@ def _recorded_audio_from_payload(payload: bytes, audio_format: QAudioFormat) -> 
     )
 
 
+def _recorded_audio_from_file(
+    path: Path,
+    audio_format: QAudioFormat,
+    captured_bytes: int,
+) -> RecordedAudio:
+    bytes_per_sample = _bytes_per_sample(audio_format)
+    frame_size = max(1, bytes_per_sample * audio_format.channelCount())
+    duration_seconds = captured_bytes / float(audio_format.sampleRate() * frame_size)
+    if duration_seconds <= 0:
+        _unlink_file(path)
+        raise RuntimeError("Recorded audio is empty.")
+
+    return RecordedAudio(
+        path=path,
+        sample_rate=audio_format.sampleRate(),
+        duration_seconds=duration_seconds,
+    )
+
+
+def _open_recording_file(audio_format: QAudioFormat) -> tuple[Path, wave.Wave_write]:
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
+        path = Path(handle.name)
+
+    wav_file = wave.open(str(path), "wb")
+    wav_file.setnchannels(audio_format.channelCount())
+    wav_file.setsampwidth(_bytes_per_sample(audio_format))
+    wav_file.setframerate(audio_format.sampleRate())
+    return path, wav_file
+
+
 def _select_snapshot_payload(
     payload: bytes,
     audio_format: QAudioFormat,
@@ -247,3 +346,59 @@ def _select_snapshot_payload(
     if remainder:
         trimmed = trimmed[remainder:]
     return trimmed
+
+
+def _trim_live_buffer(
+    buffer: bytearray,
+    audio_format: QAudioFormat | None,
+    max_duration_seconds: float | None,
+) -> None:
+    if audio_format is None or max_duration_seconds is None:
+        return
+
+    trimmed = _select_snapshot_payload(bytes(buffer), audio_format, max_duration_seconds)
+    if len(trimmed) == len(buffer):
+        return
+
+    buffer.clear()
+    buffer.extend(trimmed)
+
+
+def _has_voice_activity(
+    payload: bytes,
+    audio_format: QAudioFormat,
+    min_mean_abs: int,
+    min_peak_abs: int,
+) -> bool:
+    if not payload or audio_format.sampleFormat() != QAudioFormat.SampleFormat.Int16:
+        return bool(payload)
+
+    sample_width = _bytes_per_sample(audio_format)
+    usable_bytes = len(payload) - (len(payload) % sample_width)
+    if usable_bytes <= 0:
+        return False
+
+    samples = memoryview(payload[:usable_bytes]).cast("h")
+    if not samples:
+        return False
+
+    step = max(1, len(samples) // 4000)
+    total_abs = 0
+    count = 0
+    peak_abs = 0
+    for index in range(0, len(samples), step):
+        magnitude = abs(int(samples[index]))
+        total_abs += magnitude
+        count += 1
+        if magnitude > peak_abs:
+            peak_abs = magnitude
+
+    mean_abs = total_abs / max(1, count)
+    return mean_abs >= min_mean_abs and peak_abs >= min_peak_abs
+
+
+def _unlink_file(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:
+        pass
