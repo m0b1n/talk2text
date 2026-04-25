@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "talk2text"
+version = "0.1.0"
+description = "Ubuntu desktop speech-to-text app powered by faster-whisper and Ollama"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "faster-whisper>=1.1.1",
+  "numpy>=1.26,<3",
+  "PySide6>=6.7",
+  "sounddevice>=0.5.0",
+]
+
+[project.scripts]
+talk2text = "talk2text.ui:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
