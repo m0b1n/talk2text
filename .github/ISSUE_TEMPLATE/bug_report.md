@@ -26,7 +26,7 @@ What happened instead?
 
 ## Environment
 
-- Ubuntu version:
+- Operating system and version:
 - Installation method:
 - Whisper model:
 - Ollama enabled:

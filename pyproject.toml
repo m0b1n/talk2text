@@ -13,7 +13,6 @@ authors = [
   {name = "m0b1n"},
 ]
 keywords = [
-  "ubuntu",
   "speech-to-text",
   "whisper",
   "ollama",
@@ -22,10 +21,8 @@ keywords = [
 ]
 classifiers = [
   "Development Status :: 3 - Alpha",
-  "Environment :: X11 Applications :: Qt",
   "Intended Audience :: End Users/Desktop",
   "License :: OSI Approved :: Apache Software License",
-  "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.12",
   "Topic :: Multimedia :: Sound/Audio :: Speech",

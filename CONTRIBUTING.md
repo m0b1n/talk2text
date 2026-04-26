@@ -22,7 +22,7 @@ uv run ruff check src tests
 
 ## Guidelines
 
-- Keep Ubuntu desktop behavior working first. This project is Linux-first.
+- Keep desktop behavior portable across supported platforms.
 - Prefer small, reviewable commits.
 - Add or update tests when you change behavior.
 - Do not commit build artifacts or local model caches.

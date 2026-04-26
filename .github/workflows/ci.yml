@@ -9,9 +9,21 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            qt_qpa_platform: offscreen
+          - os: macos-latest
+            qt_qpa_platform: ""
+          - os: windows-latest
+            qt_qpa_platform: ""
+
+    runs-on: ${{ matrix.os }}
     env:
-      QT_QPA_PLATFORM: offscreen
+      QT_QPA_PLATFORM: ${{ matrix.qt_qpa_platform }}
 
     steps:
       - name: Check out repository

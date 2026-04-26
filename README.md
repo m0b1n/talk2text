@@ -5,7 +5,7 @@ It records audio with Qt, transcribes it locally with `faster-whisper`, and can 
 
 ## Status
 
-This project is an Ubuntu-focused MVP.
+This project is an early desktop MVP.
 
 What works today:
 
