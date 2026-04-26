@@ -5,7 +5,7 @@ import time
 from datetime import datetime
 from multiprocessing import freeze_support
 
-from PySide6.QtCore import Qt, QTimer, Slot
+from PySide6.QtCore import QEvent, Qt, QTimer, Slot
 from PySide6.QtWidgets import (
     QApplication,
     QListWidgetItem,
@@ -45,6 +45,25 @@ LIVE_VOICE_MEAN_ABS_THRESHOLD = 120
 LIVE_VOICE_PEAK_ABS_THRESHOLD = 800
 LIVE_LANGUAGE_LOCK_MIN_DURATION_SECONDS = 2.0
 LIVE_LANGUAGE_LOCK_MIN_WORDS = 3
+IDLE_PROMPT_TEXT = "Tap once or hold Space"
+IDLE_PLACEHOLDER_TEXT = "Tap the red button or hold Space to record."
+
+
+def _is_push_to_talk_press(
+    *,
+    key: int,
+    modifiers: Qt.KeyboardModifiers,
+    auto_repeat: bool,
+) -> bool:
+    return (
+        key == Qt.Key.Key_Space
+        and modifiers == Qt.KeyboardModifier.NoModifier
+        and not auto_repeat
+    )
+
+
+def _is_push_to_talk_release(*, key: int, auto_repeat: bool) -> bool:
+    return key == Qt.Key.Key_Space and not auto_repeat
 
 
 class MainWindow(QMainWindow):
@@ -72,12 +91,17 @@ class MainWindow(QMainWindow):
         self._active_pipeline_audio: RecordedAudio | None = None
         self._session_language_hint: str | None = None
         self._nav_buttons: list[QToolButton] = []
+        self._spacebar_pressed = False
+        self._spacebar_recording_active = False
 
         self.elapsed_timer = QTimer(self)
         self.elapsed_timer.timeout.connect(self._update_recording_clock)
         self.live_timer = QTimer(self)
         self.live_timer.setInterval(LIVE_TRANSCRIPTION_INTERVAL_MS)
         self.live_timer.timeout.connect(self._queue_live_transcription)
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
 
         self._worker_client.progress.connect(self._set_status)
         self._worker_client.live_finished.connect(self._handle_live_update)
@@ -96,12 +120,26 @@ class MainWindow(QMainWindow):
         self._load_persistent_history()
         self._load_input_devices()
         self._load_ollama_models()
-        self._show_placeholder_transcript("Tap the red button to record.")
+        self._show_placeholder_transcript(IDLE_PLACEHOLDER_TEXT)
         self._set_status("Ready")
         self._set_idle_state()
 
+    def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
+        if watched is self and event.type() == QEvent.Type.WindowDeactivate:
+            self._stop_spacebar_recording()
+            return False
+        if event.type() == QEvent.Type.KeyPress and self._handle_spacebar_press(event):
+            return True
+        if event.type() == QEvent.Type.KeyRelease and self._handle_spacebar_release(event):
+            return True
+        return super().eventFilter(watched, event)
+
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self.live_timer.stop()
+        app = QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self)
+        self._reset_spacebar_state()
         if self.recorder.is_recording:
             try:
                 _discard_recorded_audio(self.recorder.stop())
@@ -121,6 +159,48 @@ class MainWindow(QMainWindow):
 
     def _show_history_page(self) -> None:
         self.stack.setCurrentWidget(self.history_page)
+
+    def _push_to_talk_available(self) -> bool:
+        return self.isActiveWindow() and self.stack.currentWidget() is self.main_page
+
+    def _handle_spacebar_press(self, event) -> bool:
+        if not _is_push_to_talk_press(
+            key=event.key(),
+            modifiers=event.modifiers(),
+            auto_repeat=event.isAutoRepeat(),
+        ):
+            return False
+        if not self._push_to_talk_available():
+            return False
+
+        self._spacebar_pressed = True
+        if self.recorder.is_recording or self._is_processing:
+            return True
+
+        self._start_recording()
+        self._spacebar_recording_active = self.recorder.is_recording
+        return True
+
+    def _handle_spacebar_release(self, event) -> bool:
+        if not _is_push_to_talk_release(key=event.key(), auto_repeat=event.isAutoRepeat()):
+            return False
+        if not self._spacebar_pressed and not self._spacebar_recording_active:
+            return False
+
+        self._spacebar_pressed = False
+        if self._spacebar_recording_active:
+            self._stop_spacebar_recording()
+        return True
+
+    def _stop_spacebar_recording(self) -> None:
+        started_by_spacebar = self._spacebar_recording_active
+        self._reset_spacebar_state()
+        if started_by_spacebar and self.recorder.is_recording and not self._is_processing:
+            self._stop_recording()
+
+    def _reset_spacebar_state(self) -> None:
+        self._spacebar_pressed = False
+        self._spacebar_recording_active = False
 
     def _selected_language(self) -> str | None:
         return self.language_input.text().strip() or None
@@ -528,7 +608,7 @@ class MainWindow(QMainWindow):
         self._is_processing = False
         self._set_idle_state()
         self._set_status(message)
-        self.prompt_label.setText("Tap once to start")
+        self.prompt_label.setText(IDLE_PROMPT_TEXT)
 
     @Slot(str)
     def _handle_cleanup_cancelled(self, message: str) -> None:
@@ -536,7 +616,7 @@ class MainWindow(QMainWindow):
         self._is_processing = False
         self._set_idle_state()
         self._set_status(message)
-        self.prompt_label.setText("Tap once to start")
+        self.prompt_label.setText(IDLE_PROMPT_TEXT)
 
     def _add_history_entry(self, result: TranscriptionResult) -> None:
         entry = HistoryEntry(
@@ -613,8 +693,9 @@ class MainWindow(QMainWindow):
         self._recording_started_at = None
         self._pending_final_audio = None
         self._session_language_hint = None
+        self._reset_spacebar_state()
         self.recording_clock.setText("00:00")
-        self.prompt_label.setText("Tap once to start")
+        self.prompt_label.setText(IDLE_PROMPT_TEXT)
         self._set_record_button_mode("idle", "REC")
         self._set_navigation_enabled(True)
         self._update_action_buttons()

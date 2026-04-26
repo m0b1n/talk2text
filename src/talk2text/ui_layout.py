@@ -203,7 +203,7 @@ def _build_main_page(window: Any) -> QWidget:
     window.record_button.clicked.connect(window._toggle_recording)
     layout.addWidget(window.record_button, 0, Qt.AlignmentFlag.AlignHCenter)
 
-    window.prompt_label = QLabel("Tap once to start")
+    window.prompt_label = QLabel("Tap once or hold Space")
     window.prompt_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
     window.prompt_label.setStyleSheet("font-size: 10px; color: #6a5848;")
     layout.addWidget(window.prompt_label)

@@ -10,6 +10,7 @@ This project is an Ubuntu-focused MVP.
 What works today:
 
 - microphone recording through Qt Multimedia
+- hold-to-record with `Space` while the main window is focused
 - local Whisper transcription
 - optional live transcription
 - manual Ollama transcript polish
