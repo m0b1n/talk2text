@@ -32,4 +32,4 @@ jobs:
 
       - name: Run Tests
         # uv run handles the virtualenv context automatically
-        run: uv run pytest
+        run: uv run python -m unittest discover -s tests
