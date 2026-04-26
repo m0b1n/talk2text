@@ -25,8 +25,8 @@ from .models import (
     TranscriptionResult,
 )
 from .ollama_client import OllamaClient
-from .ui_shortcuts import is_push_to_talk_press, is_push_to_talk_release
 from .ui_layout import build_ui
+from .ui_shortcuts import is_push_to_talk_press, is_push_to_talk_release
 from .worker_client import ProcessWorkerClient
 
 WHISPER_MODELS = [
