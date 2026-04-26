@@ -25,6 +25,7 @@ from .models import (
     TranscriptionResult,
 )
 from .ollama_client import OllamaClient
+from .ui_shortcuts import is_push_to_talk_press, is_push_to_talk_release
 from .ui_layout import build_ui
 from .worker_client import ProcessWorkerClient
 
@@ -47,23 +48,6 @@ LIVE_LANGUAGE_LOCK_MIN_DURATION_SECONDS = 2.0
 LIVE_LANGUAGE_LOCK_MIN_WORDS = 3
 IDLE_PROMPT_TEXT = "Tap once or hold Space"
 IDLE_PLACEHOLDER_TEXT = "Tap the red button or hold Space to record."
-
-
-def _is_push_to_talk_press(
-    *,
-    key: int,
-    modifiers: Qt.KeyboardModifiers,
-    auto_repeat: bool,
-) -> bool:
-    return (
-        key == Qt.Key.Key_Space
-        and modifiers == Qt.KeyboardModifier.NoModifier
-        and not auto_repeat
-    )
-
-
-def _is_push_to_talk_release(*, key: int, auto_repeat: bool) -> bool:
-    return key == Qt.Key.Key_Space and not auto_repeat
 
 
 class MainWindow(QMainWindow):
@@ -164,7 +148,7 @@ class MainWindow(QMainWindow):
         return self.isActiveWindow() and self.stack.currentWidget() is self.main_page
 
     def _handle_spacebar_press(self, event) -> bool:
-        if not _is_push_to_talk_press(
+        if not is_push_to_talk_press(
             key=event.key(),
             modifiers=event.modifiers(),
             auto_repeat=event.isAutoRepeat(),
@@ -182,7 +166,7 @@ class MainWindow(QMainWindow):
         return True
 
     def _handle_spacebar_release(self, event) -> bool:
-        if not _is_push_to_talk_release(key=event.key(), auto_repeat=event.isAutoRepeat()):
+        if not is_push_to_talk_release(key=event.key(), auto_repeat=event.isAutoRepeat()):
             return False
         if not self._spacebar_pressed and not self._spacebar_recording_active:
             return False
