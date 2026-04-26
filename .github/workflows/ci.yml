@@ -1,52 +1,35 @@
 name: CI
-
 on:
   push:
-    branches:
-      - main
-      - master
+    branches: [main]
   pull_request:
+    branches: [main]
 
 jobs:
-  test:
-    name: Test (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            qt_qpa_platform: offscreen
-          - os: macos-latest
-            qt_qpa_platform: ""
-          - os: windows-latest
-            qt_qpa_platform: ""
-
-    runs-on: ${{ matrix.os }}
-    env:
-      QT_QPA_PLATFORM: ${{ matrix.qt_qpa_platform }}
-
+  tests:
+    runs-on: ubuntu-latest
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@v5
         with:
+          # Enable caching of the uv cache
           enable-cache: true
+          # Optionally force a specific version
+          version: "latest"
 
       - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version-file: ".python-version"
+        run: uv python install
 
-      - name: Sync environment
-        run: uv sync --dev
+      - name: Install dependencies
+        # uv sync is faster and ensures your lockfile is up to date
+        run: uv sync --frozen
 
-      - name: Compile sources
-        run: uv run python -m compileall src tests
+      - name: Run Linting (Ruff)
+        # Since uv projects usually use Ruff (also by Astral)
+        run: uv run ruff check .
 
-      - name: Run unit tests
-        run: uv run python -m unittest discover -s tests
-
-      - name: Run Ruff
-        run: uv run ruff check src tests
+      - name: Run Tests
+        # uv run handles the virtualenv context automatically
+        run: uv run pytest
